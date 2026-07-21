@@ -1,0 +1,24 @@
+name: Sync Fork
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'   # ogni 6 ore
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync fork
+        uses: tgymnich/fork-sync@v2
+        with:
+          owner: realbestia1
+          base: main
+          head: main
+          github_token: ${{ secrets.GITHUB_TOKEN }}
