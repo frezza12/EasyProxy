@@ -1,9 +1,9 @@
 name: Sync Fork
 
 on:
-  schedule:
-    - cron: '0 */6 * * *'   # ogni 6 ore
   workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"
 
 permissions:
   contents: write
@@ -13,12 +13,23 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Sync fork
-        uses: tgymnich/fork-sync@v2
+      - name: Checkout repository
+        uses: actions/checkout@v4
         with:
-          owner: realbestia1
-          base: main
-          head: main
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream
+        run: |
+          git remote add upstream https://github.com/realbestia1/EasyProxy.git
+          git fetch upstream
+
+      - name: Sync with upstream
+        run: |
+          git checkout main
+          git merge upstream/main --ff-only
+          git push origin main
