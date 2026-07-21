@@ -20,16 +20,17 @@ jobs:
 
       - name: Configure Git
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
       - name: Add upstream
         run: |
+          git remote remove upstream 2>/dev/null || true
           git remote add upstream https://github.com/realbestia1/EasyProxy.git
           git fetch upstream
 
-      - name: Sync with upstream
+      - name: Merge upstream
         run: |
           git checkout main
-          git merge upstream/main --ff-only
+          git merge upstream/main --no-edit
           git push origin main
