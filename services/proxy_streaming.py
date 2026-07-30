@@ -27,6 +27,7 @@ from services.proxy_shared import (
     ManifestRewriter,
     MPDToHLSConverter,
     parse_clearkey_params,
+    seal_clearkey,
     decrypt_segment,
     check_password,
     prepare_curl_headers,
@@ -74,7 +75,7 @@ class HLSProxyStreamingMixin:
     async def handle_ts_segment(self, request):
         """Gestisce richieste per segmenti .ts"""
         try:
-            segment_name = request.match_info.get("segment")
+            segment_name = request.match_info.get("tail")
             base_url = request.query.get("base_url")
 
             if not base_url:
@@ -1018,6 +1019,9 @@ class HLSProxyStreamingMixin:
                     rep_id = request.query.get("rep_id")
 
                     api_password = request.query.get("api_password")
+                    drm_token = request.query.get("drm_token")
+                    if clearkey_param and not drm_token:
+                        drm_token = seal_clearkey(clearkey_param)
                     rewritten_manifest = ManifestRewriter.rewrite_mpd_manifest(
                         manifest_content,
                         stream_url,
@@ -1027,6 +1031,7 @@ class HLSProxyStreamingMixin:
                         api_password,
                         bypass_warp=bypass_warp,
                         bypass_proxies=bypass_proxies,
+                        drm_token=drm_token,
                     )
 
                     return web.Response(
@@ -1323,6 +1328,16 @@ class HLSProxyStreamingMixin:
         init_url = request.query.get("init_url")
         key = request.query.get("key")
         key_id = request.query.get("key_id")
+        protected_keys = parse_clearkey_params(request)
+        if protected_keys:
+            pairs = [
+                pair.split(":", 1)
+                for pair in protected_keys.split(",")
+                if ":" in pair
+            ]
+            if pairs:
+                key_id = ",".join(pair[0] for pair in pairs)
+                key = ",".join(pair[1] for pair in pairs)
 
         is_init = request.query.get("is_init") == "1"
         skip_init = request.query.get("skip_init") == "1"
@@ -1364,54 +1379,105 @@ class HLSProxyStreamingMixin:
 
             try:
                 # Parallel download of init and media segment
-                async def fetch_init():
-                    if not init_url:
-                        return b""
-                    disable_ssl = get_ssl_setting_for_url(init_url)
+                network_errors = ALL_PROXY_ERRORS + (
+                    ClientConnectionError,
+                    ServerDisconnectedError,
+                    asyncio.TimeoutError,
+                    OSError,
+                )
+
+                async def fetch_part(session, part_url, timeout, label):
+                    if not part_url:
+                        return b"", False
+                    disable_ssl = get_ssl_setting_for_url(part_url)
                     try:
-                        async with segment_session.get(
-                            init_url,
+                        async with session.get(
+                            part_url,
                             headers=headers,
                             ssl=not disable_ssl,
-                            timeout=aiohttp.ClientTimeout(total=10),
+                            timeout=aiohttp.ClientTimeout(total=timeout),
                         ) as resp:
                             if resp.status == 200:
                                 content = await resp.read()
                                 if content:
-                                    return content
+                                    return content, False
                             logger.error(
-                                f"❌ Init segment returned status {resp.status}: {init_url}"
+                                "❌ %s returned status %s: %s",
+                                label,
+                                resp.status,
+                                part_url,
                             )
-                            return None
-                    except Exception as e:
-                        logger.error(f"❌ Failed to fetch init segment: {e}")
-                        return None
-
-                async def fetch_segment():
-                    if not url:
-                        return b""
-                    disable_ssl = get_ssl_setting_for_url(url)
-                    try:
-                        async with segment_session.get(
-                            url,
-                            headers=headers,
-                            ssl=not disable_ssl,
-                            timeout=aiohttp.ClientTimeout(total=15),
-                        ) as resp:
-                            if resp.status == 200:
-                                return await resp.read()
-                            logger.error(
-                                f"❌ Segment returned status {resp.status}: {url}"
-                            )
-                            return None
-                    except Exception as e:
-                        logger.error(f"❌ Failed to fetch segment: {e}")
-                        return None
+                            return None, False
+                    except network_errors as error:
+                        logger.error("❌ Failed to fetch %s: %r", label, error)
+                        return None, True
+                    except Exception as error:
+                        logger.error("❌ Failed to fetch %s: %r", label, error)
+                        return None, False
 
                 # Parallel fetch
-                init_content, segment_content = await asyncio.gather(
-                    fetch_init(), fetch_segment()
+                init_result, segment_result = await asyncio.gather(
+                    fetch_part(segment_session, init_url, 10, "init segment"),
+                    fetch_part(segment_session, url, 15, "segment"),
                 )
+                init_content, init_retryable = init_result
+                segment_content, segment_retryable = segment_result
+
+                # The WARP keepalive uses a separate session, so it can be
+                # healthy while this long-lived pooled connector is stale.
+                # Recreate that connector and remain on WARP for the retry.
+                can_retry_warp = (
+                    segment_proxy
+                    and segment_proxy == _shared.WARP_PROXY_URL
+                    and (init_retryable or segment_retryable)
+                )
+                if can_retry_warp:
+                    await self._invalidate_proxy_session(segment_proxy)
+                    if not await self.is_warp_healthy(timeout_sec=3):
+                        logger.warning(
+                            "WARP health probe failed; reconnecting before segment retry"
+                        )
+                        await self.reconnect_warp()
+                        await self._invalidate_proxy_session(segment_proxy)
+
+                    retry_session, retry_proxy = await self._get_proxy_session(
+                        url or init_url,
+                        bypass_warp=False,
+                        forced_proxy=segment_proxy,
+                    )
+                    try:
+                        retry_init, retry_segment = await asyncio.gather(
+                            fetch_part(
+                                retry_session,
+                                init_url if init_retryable else None,
+                                10,
+                                "init segment (WARP retry)",
+                            ),
+                            fetch_part(
+                                retry_session,
+                                url if segment_retryable else None,
+                                15,
+                                "segment (WARP retry)",
+                            ),
+                        )
+                    finally:
+                        if (
+                            retry_session
+                            and retry_proxy
+                            and not retry_session.closed
+                        ):
+                            await retry_session.close()
+                    if init_retryable and retry_init[0] is not None:
+                        init_content = retry_init[0]
+                    if segment_retryable and retry_segment[0] is not None:
+                        segment_content = retry_segment[0]
+                    if (
+                        (not init_retryable or init_content is not None)
+                        and (not segment_retryable or segment_content is not None)
+                    ):
+                        logger.warning(
+                            "Recovered ClearKey segment request through a fresh WARP session"
+                        )
             finally:
                 if segment_session and segment_proxy and not segment_session.closed:
                     await segment_session.close()
