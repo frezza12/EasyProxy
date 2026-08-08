@@ -11,7 +11,6 @@ from services.proxy_shared import (
     logger,
     web,
     yarl,
-    get_browser_activity_extractor,
     set_response_header,
     check_vavoo_request,
     get_ssl_setting_for_url,
@@ -229,10 +228,6 @@ class HLSProxyStreamingMixin:
     async def _proxy_segment(self, request, segment_url, stream_headers, segment_name):
         """✅ NUOVO: Proxy dedicato per segmenti .ts con Content-Disposition"""
         try:
-            # Ping browser-based extractors to keep shared browser alive
-            ext = get_browser_activity_extractor(self.extractors)
-            if ext and hasattr(ext, "_update_shared_activity"):
-                ext._update_shared_activity()
             self._touch_extractor_activity(
                 request.query.get("extractor_key"),
                 request.query.get("stream_key"),
@@ -419,10 +414,6 @@ class HLSProxyStreamingMixin:
         session_proxy = None
 
         try:
-            # Ping browser-based extractors to keep shared browser alive
-            ext = get_browser_activity_extractor(self.extractors)
-            if ext and hasattr(ext, "_update_shared_activity"):
-                ext._update_shared_activity()
             self._touch_extractor_activity(
                 request.query.get("extractor_key"),
                 request.query.get("stream_key"),
@@ -820,7 +811,8 @@ class HLSProxyStreamingMixin:
                     return web.Response(body=error_body, status=resp.status, headers={"Content-Type": content_type, "Access-Control-Allow-Origin": "*"})
 
                 is_direct_media_stream = (
-                    "video/" in content_type or stream_url.lower().endswith((".mp4", ".mkv", ".avi", ".mov"))
+                    "video/" in content_type
+                    or stream_url.lower().endswith((".mp4", ".mkv", ".avi", ".mov", ".mts", ".ts", ".m2ts"))
                 )
 
                 # ✅ FIX BUFFERING: Stream HLS segments chunk-by-chunk
@@ -916,7 +908,11 @@ class HLSProxyStreamingMixin:
 
                 if manifest_content:
                     logger.info(f"📄 HLS manifest detected: {stream_url}")
-                    scheme = request.headers.get("X-Forwarded-Proto", request.scheme)
+                    cf_visitor = request.headers.get("CF-Visitor", "")
+                    if '"scheme"' in cf_visitor and "https" in cf_visitor.lower():
+                        scheme = "https"
+                    else:
+                        scheme = request.headers.get("X-Forwarded-Proto", request.scheme)
                     host = request.headers.get("X-Forwarded-Host", request.host)
                     proxy_base = f"{scheme}://{host}"
                     original_url = request.query.get("orig_url") or request.query.get("url") or request.query.get("d", "")
@@ -957,7 +953,11 @@ class HLSProxyStreamingMixin:
                     manifest_content = content_bytes.decode("utf-8", errors='replace')
 
                     # ✅ CORREZIONE: Rileva lo schema e l'host corretti quando dietro un reverse proxy
-                    scheme = request.headers.get("X-Forwarded-Proto", request.scheme)
+                    cf_visitor = request.headers.get("CF-Visitor", "")
+                    if '"scheme"' in cf_visitor and "https" in cf_visitor.lower():
+                        scheme = "https"
+                    else:
+                        scheme = request.headers.get("X-Forwarded-Proto", request.scheme)
                     host = request.headers.get("X-Forwarded-Host", request.host)
                     proxy_base = f"{scheme}://{host}"
 

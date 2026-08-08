@@ -182,7 +182,7 @@ class HLSProxyExtractorHandlerMixin:
             # Check if this extractor should bypass WARP or proxies based on admin config
             extractor_key = self._extractor_key_for_instance(extractor)
             if extractor_key:
-                base_key = extractor_key.replace("_direct", "")
+                base_key = extractor_key.replace("_direct", "").replace("_noproxy", "")
                 
                 # Check warp off. embedst skips WARP by default (it needs direct/non-WARP routing).
                 warp_off_list = config_store.get("warp_off_extractors", [])
@@ -266,7 +266,11 @@ class HLSProxyExtractorHandlerMixin:
             )
 
             # Costruisci l'URL del proxy per questo stream
-            scheme = request.headers.get("X-Forwarded-Proto", request.scheme)
+            cf_visitor = request.headers.get("CF-Visitor", "")
+            if '"scheme"' in cf_visitor and "https" in cf_visitor.lower():
+                scheme = "https"
+            else:
+                scheme = request.headers.get("X-Forwarded-Proto", request.scheme)
             host = request.headers.get("X-Forwarded-Host", request.host)
             proxy_base = f"{scheme}://{host}"
 
