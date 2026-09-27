@@ -8,6 +8,7 @@ import shutil
 import config
 from config import check_password, APP_VERSION
 import config_store
+from services.proxy_shared import get_public_base_url
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +97,8 @@ def setup_recording_routes(app, recording_manager):
         warp = data.get('warp')
         proxy = data.get('proxy')
         disable_ssl = data.get('disable_ssl')
+        extractor = (data.get('extractor') or '').strip() or None
+        max_res = str(data.get('max_res') or '').strip().lower() in ('1', 'true', 'yes', 'on')
 
         # Append configuration parameters as query params to the URL
         from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
@@ -119,7 +122,9 @@ def setup_recording_routes(app, recording_manager):
         recording = await recording_manager.start_recording(
             url=url,
             name=name,
-            duration=duration
+            duration=duration,
+            extractor=extractor,
+            max_res=max_res
         )
 
         if recording:
@@ -338,9 +343,12 @@ def setup_recording_routes(app, recording_manager):
             url: Stream URL to record (required, URL-encoded)
             name: Recording name (optional)
             duration: Duration in seconds (optional)
+            extractor: Force a specific extractor instead of auto-detection (optional)
+            max_res: Record only the highest video variant (optional)
+            key_id / key: ClearKey for DRM-protected streams (optional)
 
         Example:
-            /record?url=https%3A%2F%2Fvavoo.to%2Fplay%2F...&name=Sky%20Sport&duration=3600
+            /record?url=https%3A%2F%2Fvavoo.to%2Fplay%2F...&name=Sky%20Sport&duration=3600&extractor=vavoo&max_res=1
         """
         if not check_password(request):
             return web.json_response({"error": "Unauthorized"}, status=401)
@@ -351,6 +359,8 @@ def setup_recording_routes(app, recording_manager):
 
         name = request.query.get('name')
         duration = request.query.get('duration')
+        extractor = (request.query.get('extractor') or '').strip() or None
+        max_res = request.query.get('max_res', '').strip().lower() in ('1', 'true', 'yes', 'on')
 
         # ClearKey parameters for DRM-protected streams
         key_id = request.query.get('key_id')
@@ -371,7 +381,9 @@ def setup_recording_routes(app, recording_manager):
             url=url,
             name=name,
             duration=duration,
-            clearkey=clearkey
+            clearkey=clearkey,
+            extractor=extractor,
+            max_res=max_res
         )
 
         if not recording:
@@ -389,7 +401,9 @@ def setup_recording_routes(app, recording_manager):
                         url=url,
                         name=name,
                         duration=duration,
-                        clearkey=clearkey
+                        clearkey=clearkey,
+                        extractor=extractor,
+                        max_res=max_res
                     )
                     if not recording:
                         logger.error(f"Failed to start recording after cleanup: {url}")
@@ -405,6 +419,10 @@ def setup_recording_routes(app, recording_manager):
         proxy_params = {'d': url}
         if api_password:
             proxy_params['api_password'] = api_password
+        if extractor:
+            proxy_params['host'] = extractor
+        if max_res:
+            proxy_params['max_res'] = 'true'
         if key_id:
             proxy_params['key_id'] = key_id
         if key:
@@ -448,9 +466,7 @@ def setup_recording_routes(app, recording_manager):
             return web.json_response({"error": "Recording file not available yet"}, status=404)
 
         # Redirect to the stream endpoint (absolute URL for Stremio)
-        scheme = request.headers.get('X-Forwarded-Proto', request.scheme)
-        host = request.headers.get('X-Forwarded-Host', request.host)
-        base_url = f"{scheme}://{host}"
+        base_url = get_public_base_url(request)
 
         api_password = request.query.get('api_password', '')
         stream_url = f"{base_url}/api/recordings/{recording_id}/stream"

@@ -1,4 +1,5 @@
 import logging
+import re
 
 logger = logging.getLogger("extractors.registry")
 
@@ -38,14 +39,19 @@ logger = logging.getLogger("extractors.registry")
     F16PxExtractor,
     Sports99Extractor,
 ) = None, None, None, None, None, None
+GuardabestExtractor = None
 DLStreamsExtractor = None
 StreamHGExtractor = None
 VidXgoExtractor = None
 EmbedStExtractor = None
 VidSonicExtractor = None
+VidLinkExtractor = None
+VidFastExtractor = None
 MediasetExtractor = None
 WittyTVExtractor = None
 RaiPlayExtractor = None
+ADSExtractor = None
+CinejoyExtractor = None
 
 
 # Importazione condizionale degli estrattori
@@ -203,6 +209,12 @@ except ImportError:
     logger.warning("⚠️ F16PxExtractor module not found.")
 
 try:
+    from extractors.guardabest import GuardabestExtractor
+    logger.info("✅ GuardabestExtractor module loaded.")
+except ImportError:
+    logger.warning("⚠️ GuardabestExtractor module not found.")
+
+try:
     from extractors.sports99 import Sports99Extractor
     logger.info("✅ Sports99Extractor module loaded.")
 except ImportError:
@@ -230,6 +242,20 @@ except Exception as e:
     VidSonicExtractor = None
 
 try:
+    from extractors.vidlink import VidLinkExtractor
+    logger.info("✅ VidLinkExtractor module loaded.")
+except Exception as e:
+    logger.warning("⚠️ VidLinkExtractor failed to load: %s", e)
+    VidLinkExtractor = None
+
+try:
+    from extractors.vidfast import VidFastExtractor
+    logger.info("✅ VidFastExtractor module loaded.")
+except Exception as e:
+    logger.warning("⚠️ VidFastExtractor failed to load: %s", e)
+    VidFastExtractor = None
+
+try:
     from extractors.mediaset import MediasetExtractor, WittyTVExtractor
     logger.info("✅ MediasetExtractor and WittyTVExtractor modules loaded.")
 except Exception as e:
@@ -243,6 +269,32 @@ try:
 except Exception as e:
     logger.warning("⚠️ RaiPlayExtractor failed to load: %s", e)
     RaiPlayExtractor = None
+
+try:
+    from extractors.ads import (
+        ADSExtractor,
+        ADS_HOST_PATTERN,
+        ADS_FILM_PATTERN,
+        ADS_SERIES_PATTERN,
+        ads_configured_host,
+    )
+    logger.info("✅ ADSExtractor module loaded.")
+except Exception as e:
+    logger.warning("⚠️ ADSExtractor failed to load: %s", e)
+    ADSExtractor = None
+    ADS_HOST_PATTERN = re.compile(r"(?!)")
+    ADS_FILM_PATTERN = re.compile(r"(?!)")
+    ADS_SERIES_PATTERN = re.compile(r"(?!)")
+
+    def ads_configured_host() -> str:
+        return ""
+
+try:
+    from extractors.cinejoy import CinejoyExtractor
+    logger.info("✅ CinejoyExtractor module loaded.")
+except Exception as e:
+    logger.warning("⚠️ CinejoyExtractor failed to load: %s", e)
+    CinejoyExtractor = None
 
 
 __all__ = [
@@ -269,13 +321,22 @@ __all__ = [
     "TurboVidPlayExtractor",
     "LiveTVExtractor",
     "F16PxExtractor",
+    "GuardabestExtractor",
     "Sports99Extractor",
     "DLStreamsExtractor",
     "StreamHGExtractor",
     "VidXgoExtractor",
     "EmbedStExtractor",
     "VidSonicExtractor",
+    "VidLinkExtractor",
+    "VidFastExtractor",
     "MediasetExtractor",
     "WittyTVExtractor",
     "RaiPlayExtractor",
+    "ADSExtractor",
+    "ADS_HOST_PATTERN",
+    "ADS_FILM_PATTERN",
+    "ADS_SERIES_PATTERN",
+    "ads_configured_host",
+    "CinejoyExtractor",
 ]

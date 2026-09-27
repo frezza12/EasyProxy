@@ -1,15 +1,23 @@
 import os
 import shutil
 import logging
-import random
 import socket
 import time
 import asyncio
 import contextvars
+import tracemalloc
 import urllib.request
+import ipaddress
+from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
-from config_store import get as _cfg_get, set as _cfg_set, get_all as _cfg_get_all
+from config_store import (
+    DEFAULT_RECORDINGS_DIR,
+    get as _cfg_get,
+    set as _cfg_set,
+    get_all as _cfg_get_all,
+)
 from aiohttp_socks import (
+    ProxyConnector,
     ProxyError as AioProxyError,
     ProxyConnectionError as AioProxyConnectionError,
     ProxyTimeoutError as AioProxyTimeoutError,
@@ -19,7 +27,6 @@ from python_socks import (
     ProxyConnectionError as PyProxyConnectionError,
     ProxyTimeoutError as PyProxyTimeoutError,
 )
-
 ALL_PROXY_ERRORS = (
     AioProxyError,
     AioProxyConnectionError,
@@ -30,7 +37,101 @@ ALL_PROXY_ERRORS = (
 )
 
 
-APP_VERSION = "2.9.100"
+# Proxy/WARP socket probes are blocking by design. Keep them out of asyncio's
+# default executor so DNS resolution and media/DRM work are not queued behind
+# a health check that is waiting on a dead proxy.
+_SOCKET_CHECK_EXECUTOR = ThreadPoolExecutor(
+    max_workers=8,
+    thread_name_prefix="proxy-health",
+)
+
+
+APP_VERSION = "2.13.10"
+
+_MEMORY_PROFILE_FRAMES = 15
+_memory_profile_baseline = None
+_memory_profile_baseline_at = None
+
+
+def start_memory_profiler() -> dict:
+    """Start tracemalloc and save one baseline for leak investigation."""
+    global _memory_profile_baseline, _memory_profile_baseline_at
+    if not tracemalloc.is_tracing():
+        tracemalloc.start(_MEMORY_PROFILE_FRAMES)
+    if _memory_profile_baseline is None:
+        _memory_profile_baseline = tracemalloc.take_snapshot()
+        _memory_profile_baseline_at = time.time()
+    current, peak = tracemalloc.get_traced_memory()
+    return {
+        "enabled": True,
+        "frames": _MEMORY_PROFILE_FRAMES,
+        "baseline_at": _memory_profile_baseline_at,
+        "current": current,
+        "peak": peak,
+    }
+
+
+def reset_memory_profiler() -> dict:
+    """Replace the profiler baseline with the current live allocations."""
+    global _memory_profile_baseline, _memory_profile_baseline_at
+    if not tracemalloc.is_tracing():
+        tracemalloc.start(_MEMORY_PROFILE_FRAMES)
+    _memory_profile_baseline = tracemalloc.take_snapshot()
+    _memory_profile_baseline_at = time.time()
+    tracemalloc.reset_peak()
+    current, peak = tracemalloc.get_traced_memory()
+    return {
+        "enabled": True,
+        "frames": _MEMORY_PROFILE_FRAMES,
+        "baseline_at": _memory_profile_baseline_at,
+        "current": current,
+        "peak": peak,
+    }
+
+
+def _memory_profile_stat(stat) -> dict:
+    traceback = stat.traceback
+    frame = traceback[-1] if traceback else None
+    filename = frame.filename if frame else None
+    line = frame.lineno if frame else None
+    return {
+        "location": f"{filename}:{line}" if filename and line else "unknown",
+        "file": filename,
+        "line": line,
+        "size": stat.size,
+        "size_mb": round(stat.size / (1024 * 1024), 3),
+        "count": stat.count,
+        "traceback": traceback.format()[-5:],
+    }
+
+
+def get_memory_profile(limit: int = 30) -> dict:
+    """Return top Python allocations and growth since the startup baseline."""
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 30
+    limit = max(1, min(limit, 100))
+
+    start_memory_profiler()
+    current_snapshot = tracemalloc.take_snapshot()
+    current, peak = tracemalloc.get_traced_memory()
+    baseline = _memory_profile_baseline
+    growth = current_snapshot.compare_to(baseline, "lineno") if baseline else []
+
+    return {
+        "enabled": True,
+        "frames": _MEMORY_PROFILE_FRAMES,
+        "baseline_at": _memory_profile_baseline_at,
+        "baseline_age_seconds": round(time.time() - _memory_profile_baseline_at, 1) if _memory_profile_baseline_at else None,
+        "current": current,
+        "current_mb": round(current / (1024 * 1024), 3),
+        "peak": peak,
+        "peak_mb": round(peak / (1024 * 1024), 3),
+        "top_current": [_memory_profile_stat(stat) for stat in current_snapshot.statistics("lineno")[:limit]],
+        "top_growth": [_memory_profile_stat(stat) for stat in growth[:limit]],
+        "note": "tracemalloc misura solo allocazioni Python; RSS nativo e processi figli sono in /api/info.",
+    }
 
 
 def get_extractor_proxies(extractor_name: str) -> list:
@@ -92,7 +193,12 @@ LOG_LEVEL = LOG_LEVEL_MAP.get(LOG_LEVEL_STR, logging.WARNING)
 PROXY_TEST_TIMEOUT = 10
 cpu_cores = os.cpu_count() or 4
 PROXY_TEST_CONCURRENCY = 10 if cpu_cores == 1 else min(100, max(30, cpu_cores * 15))
-WARP_PROXY_URL = "socks5h://127.0.0.1:1080"
+# Keep WARP as a normal SOCKS route. The generated WireGuard profile and
+# wireproxy decide which address family is usable for each destination.
+WARP_PROXY_URL = "socks5://127.0.0.1:1080"
+# Monotonic timestamp of the last real WARP connector use. Health probes do
+# not update it; EasyProxy uses it to recycle WireProxy only after true idle.
+WARP_LAST_ACTIVITY = 0.0
 
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -137,8 +243,6 @@ async def find_first_alive_async(proxies: list, concurrency: int | None = None) 
     """Test proxies in priority order with a staggered start, returning the highest-priority alive proxy."""
     if not proxies:
         return None
-    if getattr(proxies, "strict", False):
-        return proxies[0]
     concurrency = concurrency or PROXY_TEST_CONCURRENCY
     # Filter out globally dead proxies first
     now = time.time()
@@ -156,7 +260,7 @@ async def find_first_alive_async(proxies: list, concurrency: int | None = None) 
             
         async def _check_single(proxy_url=p, idx=i):
             try:
-                await loop.run_in_executor(None, _socket_check, proxy_url, 3)
+                await loop.run_in_executor(_SOCKET_CHECK_EXECUTOR, _socket_check, proxy_url, 3)
                 return idx, proxy_url
             except (OSError, socket.timeout):
                 return idx, None
@@ -224,7 +328,7 @@ async def filter_alive_async(proxies: list, concurrency: int | None = None) -> l
     async def _check(proxy: str):
         async with sem:
             try:
-                await loop.run_in_executor(None, _socket_check, proxy, 2)
+                await loop.run_in_executor(_SOCKET_CHECK_EXECUTOR, _socket_check, proxy, 2)
                 return proxy
             except (OSError, socket.timeout):
                 return None
@@ -252,6 +356,42 @@ def get_transport_route_proxy(url: str, transport_routes: list) -> str | None:
 def _get_dynamic_warp_enabled() -> bool:
     return _cfg_get("enable_warp", False)
 
+def should_force_max_res(
+    extractor_key: str = "",
+    requested: bool = False,
+    source: str = "",
+    proxy_endpoint: bool = False,
+) -> bool:
+    """Decide whether only the highest video variant must be served.
+
+    `requested` is the per-request &max_res flag, `source` is "mpd" or "hls".
+    Requests that belong to an extractor only honour the per-extractor list;
+    the MPD/HLS switches cover direct /proxy/mpd and /proxy/hls requests.
+    """
+    if requested:
+        return True
+    name = str(extractor_key or "").strip().lower()
+    name = name.replace("_direct", "").replace("_noproxy", "")
+    if name:
+        forced = {
+            str(item).strip().lower()
+            for item in (_cfg_get("max_res_extractors", []) or [])
+        }
+        return name in forced
+    if not proxy_endpoint:
+        return False
+    if source == "mpd":
+        return bool(_cfg_get("max_res_mpd", False))
+    if source == "hls":
+        return bool(_cfg_get("max_res_hls", False))
+    return False
+
+def is_direct_connection_allowed(bypass_warp: bool | None = None) -> bool:
+    """Allow direct only when WARP is explicitly bypassed or disabled in admin."""
+    if bypass_warp is None:
+        bypass_warp = BYPASS_WARP_CONTEXT.get()
+    return bool(bypass_warp or not _get_dynamic_warp_enabled())
+
 def _get_dynamic_warp_exclude_domains() -> list:
     defaults = _cfg_get("warp_exclude_domains", [])
     custom = _cfg_get("warp_exclude_domains_custom", [])
@@ -264,10 +404,13 @@ def _get_dynamic_warp_exclude_domains() -> list:
     return merged
 
 def _is_warp_excluded(url: str) -> bool:
-    normalized = url.lower()
-    for domain in WARP_EXCLUDE_DOMAINS:
-        stripped = domain.lstrip("*.")
-        if stripped in normalized:
+    return _matches_excluded_host(url, WARP_EXCLUDE_DOMAINS)
+
+def _matches_excluded_host(url: str, domains: list) -> bool:
+    host = (urllib.parse.urlparse(url or "").hostname or "").lower().rstrip(".")
+    for domain in domains:
+        domain = domain.lower().strip().lstrip("*.").rstrip(".")
+        if domain and (host == domain or host.endswith("." + domain)):
             return True
     return False
 
@@ -275,14 +418,7 @@ def _get_dynamic_proxy_exclude_domains() -> list:
     return _cfg_get("proxy_exclude_domains", [])
 
 def _is_proxy_excluded(url: str) -> bool:
-    if not url:
-        return False
-    normalized = url.lower()
-    for domain in PROXY_EXCLUDE_DOMAINS:
-        stripped = domain.lstrip("*.")
-        if stripped in normalized:
-            return True
-    return False
+    return _matches_excluded_host(url, PROXY_EXCLUDE_DOMAINS)
 
 def _get_dynamic_global_proxies() -> list:
     return _cfg_get("global_proxies", [])
@@ -303,18 +439,25 @@ def get_ordered_proxies_for_url(
     fallback_proxies: list | None = None,
     bypass_warp: bool | None = None,
     bypass_proxies: bool | None = None,
+    transport_routes: list | None = None,
+    global_proxies: list | None = None,
 ) -> list[str]:
-    """Build proxy priority: extractor-specific, TRANSPORT_ROUTES, fallback/global, WARP."""
+    """Build the single routing chain used by every extractor/service.
+
+    Priority is matching transport route, extractor proxy file,
+    selected/fallback proxies, global proxies, then WARP. WARP is deliberately
+    deferred even when it appears in a supplied fallback list.
+    """
     if bypass_proxies is None:
         bypass_proxies = BYPASS_PROXIES_CONTEXT.get() or _is_proxy_excluded(url or "")
 
     _ENABLE_WARP = _get_dynamic_warp_enabled()
     _WARP_PROXY_URL = WARP_PROXY_URL
+    if bypass_warp is None:
+        bypass_warp = BYPASS_WARP_CONTEXT.get()
     
     if bypass_proxies:
         ordered = []
-        if bypass_warp is None:
-            bypass_warp = BYPASS_WARP_CONTEXT.get()
         is_excluded = _is_warp_excluded(url or "")
         if _ENABLE_WARP and not bypass_warp and not is_excluded:
             ordered.append(_WARP_PROXY_URL)
@@ -333,54 +476,76 @@ def get_ordered_proxies_for_url(
         if proxy and proxy not in ordered:
             ordered.append(proxy)
 
-    _WARP_EXCLUDE_DOMAINS = _get_dynamic_warp_exclude_domains()
-    _GLOBAL_PROXIES = _get_dynamic_global_proxies()
-    _TRANSPORT_ROUTES = _get_dynamic_transport_routes()
+    _GLOBAL_PROXIES = _get_dynamic_global_proxies() if global_proxies is None else global_proxies
+    _TRANSPORT_ROUTES = _get_dynamic_transport_routes() if transport_routes is None else transport_routes
 
     selected_proxy = SELECTED_PROXY_CONTEXT.get()
     selected_proxy_is_strict = STRICT_PROXY_CONTEXT.get()
-    if selected_proxy and selected_proxy_is_strict:
+    if (
+        selected_proxy
+        and selected_proxy_is_strict
+        and not (
+            is_warp_proxy_url(selected_proxy)
+            and (bypass_warp or not _ENABLE_WARP)
+        )
+    ):
         return build([selected_proxy], strict=True)
-
-    extractor_proxies = get_extractor_proxies(extractor_name or "")
-    if extractor_proxies:
-        return build(extractor_proxies, strict=True)
 
     if url and _TRANSPORT_ROUTES:
         normalized_url = url.lower()
         for route in _TRANSPORT_ROUTES:
             url_pattern = route["url"].lower()
             if url_pattern in normalized_url:
-                proxy_value = route.get("proxy")
-                if not proxy_value:
-                    return ProxyList([], strict=False)
-                return build([proxy_value], strict=True)
+                route_proxy = route.get("proxy")
+                if not (
+                    is_warp_proxy_url(route_proxy)
+                    and (bypass_warp or not _ENABLE_WARP)
+                ):
+                    add(route_proxy)
+                break
 
-    if selected_proxy:
+    extractor_proxies = get_extractor_proxies(extractor_name or "")
+    for proxy in extractor_proxies:
+        if not is_warp_proxy_url(proxy):
+            add(proxy)
+
+    if selected_proxy and not is_warp_proxy_url(selected_proxy):
         add(selected_proxy)
 
     for proxy in fallback_proxies or []:
-        add(proxy)
+        if not is_warp_proxy_url(proxy):
+            add(proxy)
 
     for proxy in _GLOBAL_PROXIES:
-        add(proxy)
+        if not is_warp_proxy_url(proxy):
+            add(proxy)
 
-    if bypass_warp is None:
-        bypass_warp = BYPASS_WARP_CONTEXT.get()
-    normalized_url = (url or "").lower()
     is_excluded = _is_warp_excluded(url or "")
-    if _ENABLE_WARP and not bypass_warp and not is_excluded:
+    if (
+        _ENABLE_WARP
+        and not bypass_warp
+        and not is_excluded
+        and not any(is_warp_proxy_url(proxy) for proxy in ordered)
+    ):
         add(_WARP_PROXY_URL)
 
     return ProxyList(ordered, strict=False)
 
 
-def should_allow_direct_fallback(proxies: list | None) -> bool:
-    """Allow direct fallback only when no proxy exists."""
+def should_allow_direct_fallback(
+    proxies: list | None,
+    bypass_warp: bool | None = None,
+) -> bool:
+    """Allow direct when WARP is bypassed/disabled and no proxy exists."""
     if getattr(proxies, "strict", False):
         return False
     active = [proxy for proxy in proxies or [] if proxy]
-    return not active
+    if active:
+        return False
+    if bypass_warp is None:
+        bypass_warp = BYPASS_WARP_CONTEXT.get()
+    # Direct is allowed when WARP is explicitly bypassed or disabled in admin.
+    return is_direct_connection_allowed(bypass_warp)
 
 
 async def get_preferred_proxy_for_url(
@@ -397,7 +562,16 @@ async def get_preferred_proxy_for_url(
     result = await find_first_alive_async(ordered)
     if result:
         SELECTED_PROXY_CONTEXT.set(result)
-    return result
+        return result
+    if getattr(ordered, "strict", False):
+        # An explicit proxy is a caller override, not a candidate for silent
+        # WARP/direct substitution.
+        return ordered[0]
+    effective_bypass_warp = BYPASS_WARP_CONTEXT.get() if bypass_warp is None else bypass_warp
+    if _get_dynamic_warp_enabled() and not effective_bypass_warp and not _is_warp_excluded(url or ""):
+        # Fail through WARP connector; never silently fall back to direct.
+        return WARP_PROXY_URL
+    return None
 
 
 async def get_preferred_proxy_for_url_async(
@@ -414,7 +588,14 @@ async def get_preferred_proxy_for_url_async(
     result = await find_first_alive_async(ordered)
     if result:
         SELECTED_PROXY_CONTEXT.set(result)
-    return result
+        return result
+    if getattr(ordered, "strict", False):
+        return ordered[0]
+    effective_bypass_warp = BYPASS_WARP_CONTEXT.get() if bypass_warp is None else bypass_warp
+    if _get_dynamic_warp_enabled() and not effective_bypass_warp and not _is_warp_excluded(url or ""):
+        # Fail through WARP connector; never silently fall back to direct.
+        return WARP_PROXY_URL
+    return None
 
 
 DEAD_PROXIES = {}  # proxy_url -> expire_time
@@ -435,7 +616,11 @@ def is_proxy_alive(proxy_url: str, force_check: bool = False) -> bool:
                 return False
             DEAD_PROXIES.pop(proxy_url, None)
 
-    if not _socket_check(proxy_url, timeout=5):
+    try:
+        alive = _socket_check(proxy_url, timeout=5)
+    except (socket.timeout, ConnectionRefusedError, OSError):
+        alive = False
+    if not alive:
         logging.warning(f"Proxy {proxy_url} is NOT reachable.")
         return False
     return True
@@ -454,7 +639,7 @@ async def is_proxy_alive_async(proxy_url: str, force_check: bool = False) -> boo
             DEAD_PROXIES.pop(proxy_url, None)
     loop = asyncio.get_event_loop()
     try:
-        alive = await loop.run_in_executor(None, _socket_check, proxy_url, 5)
+        alive = await loop.run_in_executor(_SOCKET_CHECK_EXECUTOR, _socket_check, proxy_url, 5)
         if not alive:
             raise OSError("Proxy check returned false")
     except (socket.timeout, ConnectionRefusedError, OSError):
@@ -498,7 +683,7 @@ def mark_proxy_dead(proxy_url: str, dead_duration: int = 300):
         return
 
     _WARP_PROXY_URL = WARP_PROXY_URL
-    if _WARP_PROXY_URL and proxy_url == _WARP_PROXY_URL:
+    if _WARP_PROXY_URL and is_warp_proxy_url(proxy_url):
         logging.warning("WARP proxy %s failure observed; keeping it managed by socket health checks.", proxy_url)
         return
 
@@ -569,117 +754,43 @@ def get_proxy_for_url(
     global_proxies: list = None,
     bypass_warp: bool = None,
     bypass_proxies: bool = None,
+    extractor_name: str = "",
 ) -> str:
-    """Trova il proxy appropriato per un URL basato su TRANSPORT_ROUTES e impostazioni WARP.
-    
-    If transport_routes or global_proxies are None, reads from dynamic config_store.
+    """Return the first alive route from the common priority chain.
+
+    If every candidate is down, return a configured candidate so the caller
+    fails through that route; returning ``None`` would silently enable direct.
     """
+    if bypass_warp is None:
+        bypass_warp = BYPASS_WARP_CONTEXT.get()
     if bypass_proxies is None:
         bypass_proxies = BYPASS_PROXIES_CONTEXT.get() or _is_proxy_excluded(url or "")
 
-    if bypass_warp is None:
-        bypass_warp = BYPASS_WARP_CONTEXT.get()
-    
-    _ENABLE_WARP = _get_dynamic_warp_enabled()
-    _WARP_PROXY_URL = WARP_PROXY_URL
-
-    if bypass_proxies:
-        is_excluded = _is_warp_excluded(url) if url else False
-        if _ENABLE_WARP and not bypass_warp and not is_excluded:
-            warp_alive = is_proxy_alive(_WARP_PROXY_URL)
-            if warp_alive:
-                return _WARP_PROXY_URL
+    ordered = get_ordered_proxies_for_url(
+        url,
+        extractor_name=extractor_name,
+        bypass_warp=bypass_warp,
+        bypass_proxies=bypass_proxies,
+        transport_routes=transport_routes,
+        global_proxies=global_proxies,
+    )
+    if not ordered:
         return None
 
-    _WARP_EXCLUDE_DOMAINS = _get_dynamic_warp_exclude_domains()
-    if transport_routes is None:
-        transport_routes = _get_dynamic_transport_routes()
-    if global_proxies is None:
-        global_proxies = _get_dynamic_global_proxies()
-
-    if not url:
-        selected_proxy = SELECTED_PROXY_CONTEXT.get()
-        if selected_proxy and STRICT_PROXY_CONTEXT.get():
-            return selected_proxy
-
-    stream_key = _get_stream_key(url)
-
-    normalized_url = url.lower()
-
-    proxy = SELECTED_PROXY_CONTEXT.get()
-    if proxy and STRICT_PROXY_CONTEXT.get():
-        return proxy
-
-    if transport_routes:
-        for route in transport_routes:
-            url_pattern = route["url"].lower()
-            if url_pattern in normalized_url:
-                proxy_value = route.get("proxy")
-                if not proxy_value:
-                    return None
-                STRICT_PROXY_CONTEXT.set(True)
-                SELECTED_PROXY_CONTEXT.set(proxy_value)
-                return proxy_value
-
-    # Explicit GLOBAL_PROXY wins over WARP. warp=off disables only WARP, not configured proxies.
-    proxy = SELECTED_PROXY_CONTEXT.get()
-    if proxy and is_proxy_alive(proxy):
-        # ✅ FIX: Se bypass_warp=True e il proxy selezionato è WARP, saltalo.
-        # get_preferred_proxy_for_url (chiamato dagli estrattori) setta
-        # SELECTED_PROXY_CONTEXT a WARP, ma bypass_warp deve avere la priorità.
-        if bypass_warp and _WARP_PROXY_URL and proxy == _WARP_PROXY_URL:
-            logger.debug(
-                "Skipping WARP from SELECTED_PROXY_CONTEXT because bypass_warp=True"
-            )
-        else:
-            return proxy
-
-    # Try next alive proxy from the same source list (extractor, proxy_file, etc.)
-    proxy = _next_from_source(proxy)
-    if proxy:
-        # ✅ FIX: Se bypass_warp=True e il proxy è WARP, saltalo e continua
-        if bypass_warp and _WARP_PROXY_URL and proxy == _WARP_PROXY_URL:
-            logger.debug(
-                "Skipping WARP from _next_from_source because bypass_warp=True"
-            )
-        else:
+    PROXY_SOURCE_LIST.set(ordered)
+    for proxy in ordered:
+        if is_proxy_alive(proxy):
             SELECTED_PROXY_CONTEXT.set(proxy)
+            STRICT_PROXY_CONTEXT.set(getattr(ordered, "strict", False))
             return proxy
 
-    proxy = random.choice(global_proxies) if global_proxies else None
-    # ✅ FIX: Se bypass_warp=True e il proxy pescato da GLOBAL_PROXIES è WARP, ignoriamo
-    if bypass_warp and _WARP_PROXY_URL and proxy == _WARP_PROXY_URL:
-        proxy = None
-    if proxy:
-        SELECTED_PROXY_CONTEXT.set(proxy)
-        STRICT_PROXY_CONTEXT.set(False)
-
-    if proxy and is_proxy_alive(proxy):
-        return proxy
-
-    # Check if WARP should be used only when no explicit proxy is configured.
-    is_excluded = _is_warp_excluded(url)
-
-    if _ENABLE_WARP and not bypass_warp and not is_excluded:
-        warp_alive = is_proxy_alive(_WARP_PROXY_URL)
-        if warp_alive:
-            return _WARP_PROXY_URL
-        return None
-
-    proxy = SELECTED_PROXY_CONTEXT.get()
-    if proxy and is_proxy_alive(proxy):
-        return proxy
-
-    proxy = _next_from_source(proxy)
-    if proxy:
-        SELECTED_PROXY_CONTEXT.set(proxy)
-        return proxy
-
-    proxy = random.choice(global_proxies) if global_proxies else None
-    if proxy and is_proxy_alive(proxy):
-        return proxy
-
-    return None
+    # Keep the route non-direct even when health probing says every candidate
+    # is down. The actual request then returns the expected connection error.
+    fallback = ordered[0]
+    logger.warning("All proxy routes failed health check for %s; keeping %s", url, fallback)
+    SELECTED_PROXY_CONTEXT.set(fallback)
+    STRICT_PROXY_CONTEXT.set(getattr(ordered, "strict", False))
+    return fallback
 
 
 def get_connector_for_proxy(proxy_url: str, **kwargs):
@@ -688,6 +799,13 @@ def get_connector_for_proxy(proxy_url: str, **kwargs):
 
     if not proxy_url:
         return None
+
+    force_ipv4 = bool(kwargs.pop("force_ipv4", False))
+    health_check = bool(kwargs.pop("health_check", False))
+    is_warp = is_warp_proxy_url(proxy_url)
+    if is_warp and not health_check:
+        global WARP_LAST_ACTIVITY
+        WARP_LAST_ACTIVITY = time.monotonic()
 
     connector_url = proxy_url
     rdns = kwargs.pop("rdns", False)
@@ -701,11 +819,78 @@ def get_connector_for_proxy(proxy_url: str, **kwargs):
     elif connector_url.startswith("socks4://"):
         rdns = False
 
-    return ProxyConnector.from_url(connector_url, rdns=rdns, **kwargs)
+    # Keep upstream connections reusable. Reopening a SOCKS+TLS connection
+    # for every playlist/segment overloads userspace WireProxy and causes
+    # avoidable timeouts/buffering. The caller still controls pool limits and
+    # idle cleanup.
+    if is_warp:
+        # Keep the original hostname in the SOCKS request so TLS preserves
+        # SNI/certificate validation. wireproxy itself is IPv4-only, so its
+        # remote resolver selects the IPv4 path without replacing the host
+        # with a bare address before TLS.
+        force_ipv4 = False
+        rdns = True
+        kwargs.setdefault("keepalive_timeout", 15)
+        kwargs.setdefault("force_close", False)
+
+    connector_cls = ProxyConnector
+    if force_ipv4:
+        connector_cls = _IPv4ProxyConnector
+        kwargs.setdefault("family", socket.AF_INET)
+
+    return connector_cls.from_url(connector_url, rdns=rdns, **kwargs)
+
+
+def get_curl_ipv4_options(proxy_url: str | None) -> dict:
+    """Return curl_cffi options for IPv4-only WARP upstream requests."""
+    if not proxy_url or not is_warp_proxy_url(proxy_url):
+        return {}
+    try:
+        from curl_cffi import CurlOpt
+    except ImportError:
+        return {}
+    return {"curl_options": {CurlOpt.IPRESOLVE: 1}}
+
+
+class _IPv4ProxyConnector(ProxyConnector):
+    """Proxy connector that resolves upstream hostnames only to IPv4."""
+
+    async def _connect_via_proxy(self, host, port, ssl=None, timeout=None):
+        try:
+            target = ipaddress.ip_address(host)
+            if target.version != 4:
+                raise OSError(f"IPv4-only route cannot use IPv{target.version} target")
+            ipv4_host = host
+        except ValueError:
+            infos = await self._loop.getaddrinfo(
+                host,
+                port,
+                family=socket.AF_INET,
+                type=socket.SOCK_STREAM,
+            )
+            if not infos:
+                raise OSError(f"No IPv4 address found for {host}")
+            ipv4_host = infos[0][4][0]
+
+        return await super()._connect_via_proxy(ipv4_host, port, ssl, timeout)
+
+
+def is_warp_proxy_url(proxy_url: str | None) -> bool:
+    """Return True for the configured WARP SOCKS endpoint (socks5h/socks5)."""
+    if not proxy_url or not WARP_PROXY_URL:
+        return False
+
+    def canonical(value: str) -> str:
+        value = str(value).strip().rstrip("/")
+        if value.startswith("socks5h://"):
+            value = "socks5://" + value[len("socks5h://") :]
+        return value
+
+    return canonical(proxy_url) == canonical(WARP_PROXY_URL)
 
 
 def get_solver_proxy_url(proxy_url: str | None) -> str | None:
-    """Normalizza il proxy per solver/browser che non supportano socks5h/socks4a."""
+    """Return a browser-safe proxy while preserving the selected route."""
     if not proxy_url:
         return None
 
@@ -829,7 +1014,7 @@ def reload_config():
     mod.GLOBAL_PROXIES = _get_dynamic_global_proxies()
     mod.TRANSPORT_ROUTES = _get_dynamic_transport_routes()
     mod.DVR_ENABLED = _cfg_get("dvr_enabled", False)
-    mod.RECORDINGS_DIR = _cfg_get("recordings_dir", "/data/recordings")
+    mod.RECORDINGS_DIR = _cfg_get("recordings_dir", DEFAULT_RECORDINGS_DIR)
     mod.MAX_RECORDING_DURATION = _cfg_get("max_recording_duration", 28800)
     mod.RECORDINGS_RETENTION_DAYS = _cfg_get("recordings_retention_days", 7)
     mod.PROXY_TEST_TIMEOUT = _cfg_get("proxy_test_timeout", 10)
@@ -859,7 +1044,7 @@ def __getattr__(name):
         "GLOBAL_PROXIES": _get_dynamic_global_proxies,
         "TRANSPORT_ROUTES": _get_dynamic_transport_routes,
         "DVR_ENABLED": lambda: _cfg_get("dvr_enabled", False),
-        "RECORDINGS_DIR": lambda: _cfg_get("recordings_dir", "/data/recordings"),
+        "RECORDINGS_DIR": lambda: _cfg_get("recordings_dir", DEFAULT_RECORDINGS_DIR),
         "MAX_RECORDING_DURATION": lambda: _cfg_get("max_recording_duration", 28800),
         "RECORDINGS_RETENTION_DAYS": lambda: _cfg_get("recordings_retention_days", 7),
         "WARP_LICENSE_KEY": lambda: _cfg_get("warp_license_key", ""),
@@ -875,7 +1060,7 @@ def __getattr__(name):
 
 def get_system_stats():
     # Disk Usage
-    rec_dir = _cfg_get("recordings_dir", "/data/recordings")
+    rec_dir = _cfg_get("recordings_dir", DEFAULT_RECORDINGS_DIR)
     try:
         os.makedirs(rec_dir, exist_ok=True)
         disk_total, disk_used, disk_free = shutil.disk_usage(rec_dir)
@@ -970,12 +1155,106 @@ def get_system_stats():
     proxy_ram_used = ram_used
     proxy_ram_total = ram_total
     proxy_ram_percent = ram_percent
+    process_tree = []
+    main_process_rss = 0
+    children_rss = 0
+    ffmpeg_rss = 0
+    wireproxy_rss = 0  # Wireproxy child-process RSS
+    alighieri_rss = 0  # legacy API field; Alighieri is no longer shipped
+    wgx_rss = 0
+    warp_rss = 0
+    other_children_rss = 0
+
+    def _process_role(name: str) -> str:
+        value = (name or "").lower()
+        if "ffmpeg" in value or "ffprobe" in value:
+            return "ffmpeg"
+        if "wireproxy" in value:
+            return "wireproxy"
+        if "alighieri" in value:
+            return "alighieri"
+        if "wgx" in value:
+            return "wgx"
+        if "warp" in value:
+            return "warp"
+        return "other"
+
+    def _process_snapshot(process, role: str, memory_info) -> dict:
+        try:
+            name = process.name()
+        except Exception:
+            name = "unknown"
+        try:
+            status = process.status()
+        except Exception:
+            status = None
+        try:
+            threads = process.num_threads()
+        except Exception:
+            threads = None
+        rss = int(getattr(memory_info, "rss", 0) or 0)
+        return {
+            "pid": process.pid,
+            "name": name,
+            "role": role,
+            "status": status,
+            "rss": rss,
+            "rss_mb": round(rss / (1024 * 1024), 2),
+            "vms": int(getattr(memory_info, "vms", 0) or 0),
+            "threads": threads,
+        }
+
+    def _tracked_processes(proc):
+        """Return EasyProxy plus descendants and known proxy siblings."""
+        tracked = {proc.pid: proc}
+        try:
+            for child in proc.children(recursive=True):
+                tracked[child.pid] = child
+        except Exception:
+            pass
+        # entrypoint.sh starts wireproxy before Python, so wireproxy can be our sibling.
+        try:
+            parent = proc.parent()
+            for sibling in parent.children() if parent else []:
+                if sibling.pid == proc.pid:
+                    continue
+                if _process_role(sibling.name()) != "other":
+                    tracked[sibling.pid] = sibling
+        except Exception:
+            pass
+        return list(tracked.values())
+
     try:
         proc = psutil.Process(os.getpid())
-        proxy_ram_used = proc.memory_info().rss
-        for child in proc.children(recursive=True):
+        main_info = proc.memory_info()
+        main_process_rss = int(main_info.rss)
+        proxy_ram_used = main_process_rss
+        process_tree.append(_process_snapshot(proc, "easyproxy", main_info))
+
+        tracked_processes = _tracked_processes(proc)
+        get_system_stats._tracked_processes = tracked_processes
+        for child in tracked_processes:
+            if child.pid == proc.pid:
+                continue
             try:
-                proxy_ram_used += child.memory_info().rss
+                child_info = child.memory_info()
+                child_snapshot = _process_snapshot(child, _process_role(child.name()), child_info)
+                process_tree.append(child_snapshot)
+                child_rss = child_snapshot["rss"]
+                children_rss += child_rss
+                proxy_ram_used += child_rss
+                if child_snapshot["role"] == "ffmpeg":
+                    ffmpeg_rss += child_rss
+                elif child_snapshot["role"] == "wireproxy":
+                    wireproxy_rss += child_rss
+                elif child_snapshot["role"] == "alighieri":
+                    alighieri_rss += child_rss
+                elif child_snapshot["role"] == "wgx":
+                    wgx_rss += child_rss
+                elif child_snapshot["role"] == "warp":
+                    warp_rss += child_rss
+                else:
+                    other_children_rss += child_rss
             except Exception:
                 pass
         proxy_ram_total = ram_total
@@ -983,8 +1262,39 @@ def get_system_stats():
     except Exception:
         pass
 
-    # EasyProxy process CPU (including child processes)
+    process_tree.sort(key=lambda item: item.get("rss", 0), reverse=True)
+
+    asyncio_tasks = {"total": None, "by_coro": {}}
+    try:
+        task_counts = {}
+        for task in asyncio.all_tasks():
+            coro = task.get_coro()
+            coro_name = getattr(coro, "__qualname__", None) or type(coro).__name__
+            task_counts[coro_name] = task_counts.get(coro_name, 0) + 1
+        asyncio_tasks = {
+            "total": sum(task_counts.values()),
+            "by_coro": dict(sorted(task_counts.items(), key=lambda item: (-item[1], item[0]))),
+        }
+    except (RuntimeError, AttributeError):
+        pass
+
+    tracemalloc_stats = {"enabled": False, "current": 0, "peak": 0}
+    if tracemalloc.is_tracing():
+        traced_current, traced_peak = tracemalloc.get_traced_memory()
+        tracemalloc_stats = {
+            "enabled": True,
+            "current": traced_current,
+            "current_mb": round(traced_current / (1024 * 1024), 3),
+            "peak": traced_peak,
+            "peak_mb": round(traced_peak / (1024 * 1024), 3),
+        }
+
+    # EasyProxy process CPU (including child processes). Keep per-process
+    # readings so /api/info can identify whether Python or wireproxy is hot.
     proxy_cpu_percent = cpu_percent
+    process_cpu = {}
+    p_cpu = 0.0
+    cores = os.cpu_count() or 1
     try:
         # Use persistent Process objects: psutil.cpu_percent() needs a previous
         # baseline reading, otherwise it always returns 0.0.
@@ -995,26 +1305,38 @@ def get_system_stats():
             _cpu_proc.cpu_percent(interval=None)  # establish baseline
 
         _cpu_children = getattr(get_system_stats, "_cpu_children", {})
-        current_children = {c.pid: c for c in _cpu_proc.children(recursive=True)}
+        current_children = {
+            c.pid: c for c in getattr(get_system_stats, "_tracked_processes", [])
+            if c.pid != _cpu_proc.pid
+        }
         # Drop dead children and baseline new ones
         for pid in list(_cpu_children.keys()):
             if pid not in current_children:
                 del _cpu_children[pid]
         for pid, child in current_children.items():
             if pid not in _cpu_children:
+                try:
+                    child.cpu_percent(interval=None)  # establish baseline
+                except Exception:
+                    continue
                 _cpu_children[pid] = child
-                child.cpu_percent(interval=None)  # establish baseline
 
         p_cpu = _cpu_proc.cpu_percent(interval=None)
+        process_cpu[_cpu_proc.pid] = p_cpu
         for child in _cpu_children.values():
             try:
-                p_cpu += child.cpu_percent(interval=None)
+                child_cpu = child.cpu_percent(interval=None)
+                process_cpu[child.pid] = child_cpu
+                p_cpu += child_cpu
             except Exception:
                 pass
         get_system_stats._cpu_children = _cpu_children
 
-        cores = os.cpu_count() or 1
         proxy_cpu_percent = min(100.0, p_cpu / cores)
+        for snapshot in process_tree:
+            raw = process_cpu.get(snapshot.get("pid"), 0.0)
+            snapshot["cpu_percent_raw"] = round(raw, 1)
+            snapshot["cpu_percent"] = round(min(100.0, raw / cores), 1)
     except Exception:
         pass
 
@@ -1029,7 +1351,9 @@ def get_system_stats():
             "percent": round(cpu_percent, 1)
         },
         "proxy_cpu": {
-            "percent": round(proxy_cpu_percent, 1)
+            "percent": round(proxy_cpu_percent, 1),
+            "percent_raw": round(p_cpu, 1),
+            "cores": cores,
         },
         "ram": {
             "total": ram_total,
@@ -1043,6 +1367,28 @@ def get_system_stats():
             "free": max(0, proxy_ram_total - proxy_ram_used),
             "percent": round(proxy_ram_percent, 1)
         },
+        "processes": {
+            "count": len(process_tree),
+            "main_rss": main_process_rss,
+            "main_rss_mb": round(main_process_rss / (1024 * 1024), 2),
+            "children_rss": children_rss,
+            "children_rss_mb": round(children_rss / (1024 * 1024), 2),
+            "ffmpeg_rss": ffmpeg_rss,
+            "ffmpeg_rss_mb": round(ffmpeg_rss / (1024 * 1024), 2),
+            "wireproxy_rss": wireproxy_rss,
+            "wireproxy_rss_mb": round(wireproxy_rss / (1024 * 1024), 2),
+            "alighieri_rss": alighieri_rss,
+            "alighieri_rss_mb": round(alighieri_rss / (1024 * 1024), 2),
+            "wgx_rss": wgx_rss,
+            "wgx_rss_mb": round(wgx_rss / (1024 * 1024), 2),
+            "warp_rss": warp_rss,
+            "warp_rss_mb": round(warp_rss / (1024 * 1024), 2),
+            "other_children_rss": other_children_rss,
+            "other_children_rss_mb": round(other_children_rss / (1024 * 1024), 2),
+            "tree": process_tree,
+        },
+        "asyncio_tasks": asyncio_tasks,
+        "tracemalloc": tracemalloc_stats,
         "net": {
             "sent": round(net_sent, 1),
             "recv": round(net_recv, 1)

@@ -7,18 +7,37 @@ import urllib.parse
 import urllib.request
 import platform
 import tarfile
+import threading
 import zipfile
 import tempfile
 import services.proxy_shared as _shared
+from services import wg_tunnels
+from services import tor_proxy
 from services.proxy_shared import (
     logger, web, APP_VERSION,
     check_password, get_client_ip, PlaylistBuilder, ClientSession, ClientTimeout,
     TCPConnector, ProxyConnector, get_connector_for_proxy, API_PASSWORD,
+    get_public_base_url,
 )
 from extractors.registry import *
 import config_store
 import config as _config
-from config import reload_config, clear_proxy_affinity, get_system_stats
+from config import (
+    reload_config,
+    clear_proxy_affinity,
+    get_system_stats,
+    get_memory_profile,
+    reset_memory_profiler,
+)
+
+_SPEEDTEST_LOCK = asyncio.Lock()
+_PROXY_ENV_KEYS = (
+    "ALL_PROXY", "all_proxy",
+    "HTTP_PROXY", "http_proxy",
+    "HTTPS_PROXY", "https_proxy",
+    "SOCKS_PROXY", "socks_proxy",
+    "NO_PROXY", "no_proxy",
+)
 
 class HLSProxyPagesMixin:
 
@@ -31,10 +50,8 @@ class HLSProxyPagesMixin:
 
         try:
             url_param = request.query.get("url")
-
             if not url_param:
                 return web.Response(text="Missing 'url' parameter", status=400)
-
             if not url_param.strip():
                 return web.Response(text="'url' parameter cannot be empty", status=400)
 
@@ -46,23 +63,34 @@ class HLSProxyPagesMixin:
                     text="No valid playlist definition found", status=400
                 )
 
-            # ✅ CORREZIONE: Rileva lo schema e l'host corretti quando dietro un reverse proxy
-            scheme = request.headers.get("X-Forwarded-Proto", request.scheme)
-            host = request.headers.get("X-Forwarded-Host", request.host)
-            base_url = f"{scheme}://{host}"
+            base_url = get_public_base_url(request)
 
             # ✅ FIX: Passa api_password al builder se presente
             api_password = request.query.get("api_password")
 
-            async def generate_response():
-                async for (
-                    line
-                ) in self.playlist_builder.async_generate_combined_playlist(
-                    playlist_definitions, base_url, api_password=api_password
-                ):
-                    yield line.encode("utf-8")
+            # Genera e raccoglie completamente la playlist in memoria prima di
+            # rispondere, invece di inviarla in streaming (chunked) chunk per
+            # chunk. Alcuni client a valle (es. Cloudflare Worker + APTV)
+            # restano bloccati in attesa su risposte StreamResponse/chunked,
+            # mentre gestiscono correttamente una risposta bufferizzata con
+            # Content-Length. La logica di generazione/riscrittura degli URL
+            # non cambia.
+            #
+            # Ottimizzazione memoria: invece di accumulare stringhe in una
+            # lista e poi fare "".join(...) + .encode("utf-8") (che tiene in
+            # memoria contemporaneamente lista di stringhe + stringa unita +
+            # buffer bytes finale, cioè fino a 3 copie parziali), si accumula
+            # direttamente in un bytearray man mano che le righe arrivano.
+            # Questo mantiene un'unica struttura che cresce in place, con un
+            # picco di memoria inferiore per playlist molto grandi.
+            buf = bytearray()
+            async for line in self.playlist_builder.async_generate_combined_playlist(
+                playlist_definitions, base_url, api_password=api_password
+            ):
+                buf.extend(line.encode("utf-8"))
 
-            response = web.StreamResponse(
+            return web.Response(
+                body=bytes(buf),
                 status=200,
                 headers={
                     "Content-Type": "application/vnd.apple.mpegurl",
@@ -70,14 +98,6 @@ class HLSProxyPagesMixin:
                     "Access-Control-Allow-Origin": "*",
                 },
             )
-
-            await response.prepare(request)
-
-            async for chunk in generate_response():
-                await response.write(chunk)
-
-            await response.write_eof()
-            return response
 
         except (ConnectionResetError, OSError) as e:
             logger.info(f"Playlist download interrupted (client disconnected): {e}")
@@ -240,10 +260,8 @@ class HLSProxyPagesMixin:
 
     async def handle_api_info(self, request):
         """Endpoint API che restituisce le informazioni sul server in formato JSON."""
-        # Refresh version on API call
-        await self._refresh_latest_version()
-
         stats = get_system_stats()
+        active_streams = _shared.get_active_streams()
 
         info = {
             "proxy": "EasyProxy",
@@ -256,6 +274,7 @@ class HLSProxyPagesMixin:
                 "✅ Playlist building",
                 "✅ Supporto Proxy (SOCKS5, HTTP/S)",
                 "✅ Multi-extractor support",
+                "✅ DUAL video + audio sync with VLC HLS master",
                 "✅ CORS enabled",
             ],
             "extractors_loaded": list(self.extractors.keys()),
@@ -263,7 +282,8 @@ class HLSProxyPagesMixin:
                 "extractors_cached": len(self.extractors),
                 "cdn_tokens": len(getattr(self, '_renewed_cdn_tokens', {})),
                 "proxy_sessions_cached": len(getattr(self, '_proxy_sessions', {})),
-                "active_stream_sessions": len(_shared.ACTIVE_STREAM_SESSIONS),
+                "active_stream_sessions": len(active_streams),
+                "active_stream_sessions_window_seconds": 30,
                 "bypassed_warp_domains": len(_shared.BYPASSED_WARP_DOMAINS),
                 "template_cache": len(getattr(self, '_template_cache', {})),
                 "dead_proxies": len(getattr(_config, 'DEAD_PROXIES', {})),
@@ -276,8 +296,17 @@ class HLSProxyPagesMixin:
                     for s in getattr(self, '_proxy_sessions', {}).values()
                     if s and not s.closed and hasattr(s, '_connector') and hasattr(s._connector, '_conns')
                 ),
+                "parallel_fetch": dict(getattr(self, "_parallel_fetch_stats", {})),
+                "cpu": stats.get("cpu", {}),
+                "proxy_cpu": stats.get("proxy_cpu", {}),
+                "net": stats.get("net", {}),
             },
-            "memory": stats.get("proxy_ram", {}),
+            "memory": {
+                **stats.get("proxy_ram", {}),
+                "tracemalloc": stats.get("tracemalloc", {}),
+                "processes": stats.get("processes", {}),
+                "asyncio_tasks": stats.get("asyncio_tasks", {}),
+            },
             "modules": {
                 "playlist_builder": PlaylistBuilder is not None,
                 "vavoo_extractor": VavooExtractor is not None,
@@ -306,6 +335,15 @@ class HLSProxyPagesMixin:
                 "/license": "Proxy licenze DRM (ClearKey/Widevine) - ?url=<URL> o ?clearkey=<id:key>",
                 "/info": "Pagina HTML con informazioni sul server",
                 "/api/info": "Endpoint JSON con informazioni sul server",
+                "/api/memory/profile": "Profiler tracemalloc: allocazioni Python e crescita dal boot",
+                "/api/memory/profile/reset": "POST: resetta il baseline del profiler",
+                "/api/dual/memory": "RAM used by the integrated DUAL service",
+                "/dual/manifest.m3u8": "DUAL HLS master with synchronized video + audio - ?d=<Base64 JSON>",
+                "/dual/sync/links": "DUAL JSON test for synchronizing video and audio",
+                "/dual/cache/status": "Checks only whether the DUAL offset exists in the shared MongoDB cache",
+                "/dual/aud/{hid}/audio.m3u8": "Synchronized DUAL audio playlist",
+                "/dual/aud/{hid}/init.mp4": "DUAL audio init segment",
+                "/dual/aud/{hid}/s{idx}.m4s": "DUAL audio segment",
             },
             "usage_examples": {
                 "proxy_hls": "/proxy/hls/manifest.m3u8?d=https://example.com/stream.m3u8",
@@ -313,13 +351,27 @@ class HLSProxyPagesMixin:
                 "aes_key": "/key?key_url=https://server.com/key.bin",  # ✅ NUOVO
                 "playlist": "/playlist?url=http://example.com/playlist1.m3u8;http://example.com/playlist2.m3u8",
                 "custom_headers": "/proxy/hls/manifest.m3u8?d=<URL>&h_Authorization=Bearer%20token",
+                "forced_extractor": "/proxy/hls/manifest.m3u8?d=<URL>&host=vavoo&max_res=true",
+                "dual_hls": "/dual/manifest.m3u8?d=<Base64URL(JSON)> [&api_password=<PASSWORD>]",
             },
         }
         return web.json_response(info)
 
+    async def handle_memory_profile(self, request):
+        """Return top Python allocations and growth since the profiler baseline."""
+        if not check_password(request):
+            return web.Response(status=401, text="Unauthorized: Invalid API Password")
+        return web.json_response(get_memory_profile(request.query.get("limit", 30)))
+
+    async def handle_memory_profile_reset(self, request):
+        """Reset the tracemalloc baseline used by the memory profiler."""
+        if not check_password(request):
+            return web.Response(status=401, text="Unauthorized: Invalid API Password")
+        return web.json_response(reset_memory_profiler())
+
     async def handle_openapi(self, request):
         """Espone una specifica OpenAPI minimale per Swagger/ReDoc."""
-        server_url = f"{request.scheme}://{request.host}"
+        server_url = get_public_base_url(request)
         requires_password = bool(API_PASSWORD)
 
         security_schemes = {
@@ -339,15 +391,57 @@ class HLSProxyPagesMixin:
             "info": {
                 "title": "EasyProxy API",
                 "version": version,
-                "description": (
-                    "Interactive documentation for EasyProxy. "
-                    "Includes HLS/MPD proxying, extractor endpoints, key and license helpers, "
-                    "playlist generation, admin API, DVR/recording management, "
-                    "and compatibility endpoints inspired by MediaFlow Proxy."
+                    "description": (
+                        "Interactive documentation for EasyProxy. "
+                        "Includes HLS/MPD proxying, extractor endpoints, key and license helpers, "
+                        "playlist generation, admin API, DVR/recording management, "
+                        "DUAL video/audio synchronization with VLC HLS master generation, "
+                        "and compatibility endpoints inspired by MediaFlow Proxy."
                 ),
             },
             "servers": [{"url": server_url}],
-            "components": {"securitySchemes": security_schemes},
+            "components": {
+                "securitySchemes": security_schemes,
+                "schemas": {
+                    "DualSource": {
+                        "type": "object",
+                        "description": "Direct URL or extractor source. Use url for a direct manifest, or extractor + d for an extractor page.",
+                        "properties": {
+                            "url": {"type": "string", "format": "uri"},
+                            "extractor": {"type": "string", "example": "vixsrc"},
+                            "d": {"type": "string", "format": "uri"},
+                            "headers": {"type": "object", "additionalProperties": {"type": "string"}},
+                            "warp_off": {"type": "boolean", "default": False},
+                            "proxy_off": {"type": "boolean", "default": False},
+                            "proxy": {"type": "string", "description": "Optional forced proxy URL or off."},
+                        },
+                    },
+                    "DualSyncRequest": {
+                        "type": "object",
+                        "required": ["video", "audio", "audio_lang"],
+                        "properties": {
+                            "video": {"$ref": "#/components/schemas/DualSource"},
+                            "audio": {"$ref": "#/components/schemas/DualSource"},
+                            "audio_lang": {
+                                "type": "string",
+                                "description": "HLS LANGUAGE code or NAME alias.",
+                                "enum": ["ita", "eng", "spa", "fra", "deu", "hin", "rus", "it", "en", "es", "fr", "de", "hi", "ru"],
+                                "example": "ita",
+                            },
+                            "resolution": {"type": "integer", "enum": [720, 1080, 1440, 2160], "description": "Optional override. Omit it to select the highest available video quality automatically.", "example": 2160},
+                            "bypass_audio_language": {"type": "boolean", "default": False, "description": "When true, ignore a language mismatch and use the DEFAULT or best available audio track."},
+                            "reference_audio_url": {"type": "string", "format": "uri"},
+                            "media_key": {"type": "string"},
+                            "video_fingerprint": {"type": "string"},
+                        },
+                        "example": {
+                            "video": {"url": "https://info.movieboxnoob.cc/playlist/ZgRENwVpICUbvjgdTAAjvA.m3u8"},
+                            "audio": {"extractor": "vixsrc", "d": "https://vixsrc.to/movie/1339713/"},
+                            "audio_lang": "ita",
+                        },
+                    },
+                },
+            },
             "paths": {
 
                 # --- System & Public ---
@@ -357,6 +451,94 @@ class HLSProxyPagesMixin:
                         "summary": "Server information",
                         "description": "Returns server status, loaded extractors, modules, and example endpoints.",
                         "responses": {"200": {"description": "Server information JSON"}},
+                    }
+                },
+                "/api/dual/memory": {
+                    "get": {
+                        "summary": "DUAL memory usage",
+                        "description": "Returns RSS used by the in-process DUAL service and its active audio tracks.",
+                        "responses": {
+                            "200": {"description": "DUAL memory usage JSON"},
+                            "401": {"description": "Invalid API password"},
+                        },
+                        **({"security": security} if requires_password else {}),
+                    }
+                },
+                "/dual/manifest.m3u8": {
+                    "get": {
+                        "summary": "DUAL HLS master",
+                        "description": "Builds one HLS master containing a selected video and an extracted, synchronized audio track. The video is always served through EasyProxy's HLS proxy. The d parameter is URL-safe Base64 JSON.",
+                        "parameters": [
+                            {"name": "d", "in": "query", "required": True, "schema": {"type": "string"}, "description": "URL-safe Base64 JSON DualSyncRequest payload."},
+                            {"name": "api_password", "in": "query", "schema": {"type": "string"}},
+                        ],
+                        "responses": {
+                            "200": {"description": "Combined HLS master playlist", "content": {"application/vnd.apple.mpegurl": {"schema": {"type": "string"}}}},
+                            "400": {"description": "Invalid Base64 JSON descriptor or source"},
+                            "401": {"description": "Invalid API password"},
+                            "409": {"description": "Synchronization unavailable; JSON error response"},
+                            "502": {"description": "Extraction or upstream failure"},
+                        },
+                        **({"security": security} if requires_password else {}),
+                    }
+                },
+                "/dual/sync/links": {
+                    "post": {
+                        "summary": "Sync direct or extracted video/audio links",
+                        "description": "Resolves the two sources, selects the requested HLS audio language/NAME alias, prepares audio in memory, calculates the offset, and returns the synchronized result as JSON.",
+                        "requestBody": {
+                            "required": True,
+                            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/DualSyncRequest"}}},
+                        },
+                        "responses": {
+                            "200": {"description": "Synchronization result"},
+                            "400": {"description": "Invalid source or language"},
+                            "401": {"description": "Invalid API password"},
+                            "409": {"description": "Synchronization failed"},
+                            "502": {"description": "Extraction or upstream failure"},
+                        },
+                        **({"security": security} if requires_password else {}),
+                    }
+                },
+                "/dual/aud/{hid}/audio.m3u8": {
+                    "get": {
+                        "summary": "Serve synchronized audio playlist",
+                        "description": "Returns the generated fragmented MP4 audio playlist with the requested offset and playback rate.",
+                        "parameters": [
+                            {"name": "hid", "in": "path", "required": True, "schema": {"type": "string"}},
+                            {"name": "o", "in": "query", "schema": {"type": "integer", "default": 0}, "description": "Offset in milliseconds."},
+                            {"name": "r", "in": "query", "schema": {"type": "integer", "default": 1000000000}, "description": "Playback rate in nano-units."},
+                            {"name": "t", "in": "query", "required": True, "schema": {"type": "string"}},
+                        ],
+                        "responses": {"200": {"description": "Audio HLS playlist"}, "401": {"description": "Invalid DUAL session"}, "410": {"description": "Audio session expired"}},
+                        **({"security": security} if requires_password else {}),
+                    }
+                },
+                "/dual/aud/{hid}/init.mp4": {
+                    "get": {
+                        "summary": "Serve audio fragmented MP4 init",
+                        "description": "Returns the initialization fragment for the active DUAL audio track.",
+                        "parameters": [{"name": "hid", "in": "path", "required": True, "schema": {"type": "string"}}, {"name": "t", "in": "query", "required": True, "schema": {"type": "string"}}],
+                        "responses": {"200": {"description": "MP4 initialization fragment"}, "401": {"description": "Invalid DUAL session"}, "410": {"description": "Audio session expired"}},
+                        **({"security": security} if requires_password else {}),
+                    }
+                },
+                "/dual/aud/{hid}/s{idx}.m4s": {
+                    "get": {
+                        "summary": "Serve audio fragmented MP4 segment",
+                        "description": "Returns one active DUAL audio segment after applying the requested offset/rate.",
+                        "parameters": [{"name": "hid", "in": "path", "required": True, "schema": {"type": "string"}}, {"name": "idx", "in": "path", "required": True, "schema": {"type": "integer"}}, {"name": "o", "in": "query", "schema": {"type": "integer"}}, {"name": "r", "in": "query", "schema": {"type": "integer"}}, {"name": "t", "in": "query", "required": True, "schema": {"type": "string"}}],
+                        "responses": {"200": {"description": "Audio segment"}, "401": {"description": "Invalid DUAL session"}, "410": {"description": "Audio session expired"}},
+                        **({"security": security} if requires_password else {}),
+                    }
+                },
+                "/dual/cache/status": {
+                    "post": {
+                        "summary": "Check cached DUAL offset",
+                        "description": "Returns only whether the requested video/audio offset exists in the shared MongoDB cache. Audio is not exposed as a persistent cache.",
+                        "requestBody": {"required": True, "content": {"application/json": {"schema": {"type": "object"}}}},
+                        "responses": {"200": {"description": "Offset cache status JSON"}, "400": {"description": "Missing media key, resolution or fingerprint"}, "401": {"description": "Invalid API password"}},
+                        **({"security": security} if requires_password else {}),
                     }
                 },
                 "/health": {
@@ -417,6 +599,8 @@ class HLSProxyPagesMixin:
                         "description": "MediaFlow-compatible HLS proxy endpoint.",
                         "parameters": [
                             {"name": "d", "in": "query", "schema": {"type": "string"}, "required": True, "description": "Destination manifest URL"},
+                            {"name": "host", "in": "query", "schema": {"type": "string"}, "description": "Force a specific extractor instead of auto-detection"},
+                            {"name": "max_res", "in": "query", "schema": {"type": "boolean"}, "description": "Serve only the highest video variant"},
                             {"name": "api_password", "in": "query", "schema": {"type": "string"}},
                         ],
                         "responses": {"200": {"description": "Proxied HLS manifest"}},
@@ -439,6 +623,8 @@ class HLSProxyPagesMixin:
                         "description": "Converts or relays MPEG-DASH/MPD streams through EasyProxy.",
                         "parameters": [
                             {"name": "d", "in": "query", "schema": {"type": "string"}, "required": True, "description": "Destination MPD URL"},
+                            {"name": "host", "in": "query", "schema": {"type": "string"}, "description": "Force a specific extractor instead of auto-detection"},
+                            {"name": "max_res", "in": "query", "schema": {"type": "boolean"}, "description": "Serve only the highest video variant"},
                             {"name": "key_id", "in": "query", "schema": {"type": "string"}},
                             {"name": "key", "in": "query", "schema": {"type": "string"}},
                             {"name": "api_password", "in": "query", "schema": {"type": "string"}},
@@ -727,9 +913,15 @@ class HLSProxyPagesMixin:
                 "/record": {
                     "get": {
                         "summary": "Start recording via GET",
-                        "description": "Quick-start a recording from a URL query parameter.",
+                        "description": "Quick-start a recording from a URL query parameter and redirect to the live stream while recording.",
                         "parameters": [
                             {"name": "url", "in": "query", "schema": {"type": "string"}, "required": True},
+                            {"name": "name", "in": "query", "schema": {"type": "string"}},
+                            {"name": "duration", "in": "query", "schema": {"type": "integer"}, "description": "Recording duration in seconds"},
+                            {"name": "extractor", "in": "query", "schema": {"type": "string"}, "description": "Force a specific extractor instead of auto-detection"},
+                            {"name": "max_res", "in": "query", "schema": {"type": "boolean"}, "description": "Record only the highest video variant"},
+                            {"name": "key_id", "in": "query", "schema": {"type": "string"}, "description": "ClearKey key ID for DRM-protected streams"},
+                            {"name": "key", "in": "query", "schema": {"type": "string"}, "description": "ClearKey key for DRM-protected streams"},
                             {"name": "api_password", "in": "query", "schema": {"type": "string"}},
                         ],
                         "responses": {"200": {"description": "Recording started"}},
@@ -773,9 +965,16 @@ class HLSProxyPagesMixin:
                                 "application/json": {
                                     "schema": {
                                         "type": "object",
+                                        "required": ["url"],
                                         "properties": {
-                                            "url": {"type": "string"},
-                                            "stream_type": {"type": "string"},
+                                            "url": {"type": "string", "description": "Stream URL to record"},
+                                            "name": {"type": "string", "description": "Human-readable recording name"},
+                                            "duration": {"type": "integer", "description": "Recording duration in seconds"},
+                                            "extractor": {"type": "string", "description": "Force a specific extractor instead of auto-detection"},
+                                            "max_res": {"type": "boolean", "description": "Record only the highest video variant"},
+                                            "warp": {"type": "string", "enum": ["off"], "description": "Bypass WARP for this recording"},
+                                            "proxy": {"type": "string", "enum": ["off"], "description": "Bypass configured proxies for this recording"},
+                                            "disable_ssl": {"type": "string", "enum": ["1"], "description": "Disable SSL verification for this recording"},
                                         },
                                     }
                                 }
@@ -898,9 +1097,7 @@ class HLSProxyPagesMixin:
             generated_urls = []
 
             # Determina base URL del proxy
-            scheme = request.headers.get("X-Forwarded-Proto", request.scheme)
-            host = request.headers.get("X-Forwarded-Host", request.host)
-            proxy_base = f"{scheme}://{host}"
+            proxy_base = get_public_base_url(request)
 
             for item in urls_to_process:
                 dest_url = item.get("destination_url")
@@ -1052,6 +1249,7 @@ class HLSProxyPagesMixin:
             "enable_warp", "warp_license_key",
             "global_proxies", "transport_routes", "extractor_proxies",
             "warp_off_extractors", "proxy_off_extractors", "warp_exclude_domains_custom", "proxy_exclude_domains",
+            "max_res_extractors", "max_res_mpd", "max_res_hls",
             "dvr_enabled",
             "max_recording_duration", "recordings_retention_days",
             "proxy_test_timeout", "proxy_test_concurrency",
@@ -1069,7 +1267,7 @@ class HLSProxyPagesMixin:
             clear_proxy_affinity()
             # Invalidate extractor cache if proxy/routing/WARP settings changed
             if any(k in updates for k in ("global_proxies", "extractor_proxies", "transport_routes", "warp_off_extractors", "proxy_off_extractors", "warp_exclude_domains_custom", "proxy_exclude_domains", "enable_warp")):
-                self.extractors.clear()
+                self._invalidate_extractors()
                 logger.info("Extractor cache cleared due to config change")
 
         return web.json_response({"status": "ok", "updated": list(updates.keys())})
@@ -1086,10 +1284,11 @@ class HLSProxyPagesMixin:
         config_store.set("enable_warp", bool(enable))
         reload_config()
         clear_proxy_affinity()
-        self.extractors.clear()
+        self._invalidate_extractors()
 
         if enable:
             logger.info("WARP enabled via admin panel")
+            self._warp_status_checked_at = 0.0
             result = await self.reconnect_warp()
             if result.get("status") != "ok":
                 logger.warning(f"WARP enable failed: {result.get('message')}")
@@ -1097,6 +1296,9 @@ class HLSProxyPagesMixin:
         else:
             logger.info("WARP disabled via admin panel")
             await self._stop_warp_proxy()
+            self.warp_status = "Disabled"
+            self._warp_ip = ""
+            self._warp_status_checked_at = time.monotonic()
 
         return web.json_response({"status": "ok", "warp": "enabled" if enable else "disabled"})
 
@@ -1134,7 +1336,7 @@ class HLSProxyPagesMixin:
         config_store.set("extractor_proxies", extractor_proxies)
         reload_config()
         clear_proxy_affinity()
-        self.extractors.clear()
+        self._invalidate_extractors()
 
         return web.json_response({"status": "ok", "extractor": extractor, "proxy": proxy or None})
 
@@ -1166,7 +1368,7 @@ class HLSProxyPagesMixin:
             config_store.replace_all(data)
             reload_config()
             clear_proxy_affinity()
-            self.extractors.clear()
+            self._invalidate_extractors()
             return web.json_response({"status": "ok", "message": "Config imported successfully"})
         except json.JSONDecodeError:
             return web.Response(status=400, text="Invalid JSON file")
@@ -1182,22 +1384,33 @@ class HLSProxyPagesMixin:
             from config import WARP_PROXY_URL
             if config_store.get("enable_warp", False):
                 routes.append({"name": "Via WARP", "proxy": WARP_PROXY_URL})
+            if (await tor_proxy.status()).get("running"):
+                routes.append({
+                    "name": "Via Tor",
+                    "proxy": f"socks5://{tor_proxy.get_bind()}",
+                })
+            # Secondary WireGuard tunnels: only when their wireproxy is running.
+            for slot, label in (("nordvpn", "Via NordVPN"), ("custom", "Via Custom WireGuard")):
+                if wg_tunnels.process_running(slot):
+                    routes.append({
+                        "name": label,
+                        "proxy": f"socks5://{wg_tunnels.get_bind(slot)}",
+                    })
             global_proxies = config_store.get("global_proxies", [])
             if global_proxies:
                 routes.append({"name": "Via Proxy", "proxy": global_proxies[0]})
-            from concurrent.futures import ThreadPoolExecutor
-            loop = asyncio.get_event_loop()
-            with ThreadPoolExecutor(max_workers=len(routes)) as pool:
-                futures = [loop.run_in_executor(pool, self._run_speedtest, r["proxy"]) for r in routes]
-                results = await asyncio.gather(*futures, return_exceptions=True)
             output = []
-            for i, r in enumerate(routes):
-                res = results[i]
-                if isinstance(res, Exception):
-                    output.append({"name": r["name"], "error": str(res)})
-                else:
-                    res["name"] = r["name"]
-                    output.append(res)
+            # Run routes one at a time. Concurrent Ookla tests compete for the
+            # same uplink/downlink and make the displayed comparison invalid.
+            async with _SPEEDTEST_LOCK:
+                for route in routes:
+                    try:
+                        res = await asyncio.to_thread(self._run_speedtest, route["proxy"])
+                    except Exception as exc:
+                        output.append({"name": route["name"], "error": str(exc)})
+                    else:
+                        res["name"] = route["name"]
+                        output.append(res)
             return web.json_response({"results": output})
         except Exception as e:
             logger.error(f"Speedtest failed: {e}")
@@ -1276,28 +1489,25 @@ class HLSProxyPagesMixin:
     def _run_speedtest(self, proxy_url=None):
         import subprocess
         import os as _os
+        if proxy_url:
+            return self._run_proxy_speedtest(proxy_url)
+
         exe = self._ensure_speedtest_exe()
+        command = [exe, "--format", "json", "--accept-license", "--accept-gdpr"]
+
+        # DIRECT must not inherit a proxy from the container/VPS shell.
+        env = _os.environ.copy()
+        for key in _PROXY_ENV_KEYS:
+            env.pop(key, None)
         try:
-            env = None
-            if proxy_url:
-                env = _os.environ.copy()
-                # Socks5h per WARP, HTTP per proxy normali
-                if "socks5" in proxy_url:
-                    env["ALL_PROXY"] = proxy_url
-                else:
-                    env["HTTPS_PROXY"] = proxy_url
-                    env["HTTP_PROXY"] = proxy_url
             result = subprocess.run(
-                [exe, "--format", "json", "--accept-license", "--accept-gdpr"],
+                command,
                 capture_output=True, text=True, timeout=60, env=env
             )
             if result.returncode != 0:
                 err = result.stderr
                 if "Network is unreachable" in err or "Cannot retrieve configuration" in err:
-                    if proxy_url:
-                        raise RuntimeError(f"Connection refused by proxy: {proxy_url}. Make sure WARP is connected or the proxy is reachable.")
-                    else:
-                        raise RuntimeError("No internet connection. Check your network.")
+                    raise RuntimeError("No internet connection. Check your network.")
                 raise RuntimeError(f"Speedtest failed: {err.split('[')[-1].rstrip(']') if '[' in err else err[:100]}")
             data = json.loads(result.stdout)
             return {
@@ -1314,3 +1524,204 @@ class HLSProxyPagesMixin:
             raise RuntimeError("Speedtest timed out after 60 seconds")
         except json.JSONDecodeError:
             raise RuntimeError("Failed to parse speedtest output")
+
+    def _proxy_curl_args(self, proxy_url):
+        """Return curl arguments that force DNS and TCP through one proxy."""
+        parsed = urllib.parse.urlparse(proxy_url)
+        scheme = (parsed.scheme or "").lower()
+        if scheme in ("socks5", "socks5h"):
+            proxy_flag = "--socks5-hostname"
+        elif scheme in ("http", "https"):
+            proxy_flag = "--proxy"
+        else:
+            raise RuntimeError(f"Unsupported proxy scheme: {scheme or 'missing'}")
+        if not parsed.hostname or not parsed.port:
+            raise RuntimeError(f"Invalid proxy URL: {proxy_url}")
+
+        username = urllib.parse.unquote(parsed.username or "")
+        password = urllib.parse.unquote(parsed.password or "")
+        if any(char.isspace() for char in username + password):
+            raise RuntimeError("Proxy credentials contain unsupported whitespace")
+
+        host = parsed.hostname
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        target = f"{host}:{parsed.port}"
+        args = [proxy_flag, target]
+        if scheme in ("http", "https"):
+            # The proxy itself is normally plain HTTP even when the URL was
+            # entered as https://; curl's --proxy-user handles auth safely.
+            args = [proxy_flag, f"http://{target}"]
+        if username or password:
+            args.extend(["--proxy-user", f"{username}:{password}"])
+        return args
+
+    def _run_proxy_curl(self, proxy_url, url, write_out, extra=None, timeout=60, allow_timeout=False):
+        import subprocess
+        curl = shutil.which("curl") or shutil.which("curl.exe")
+        if not curl:
+            raise RuntimeError("Proxy speedtest unavailable: curl is not installed")
+
+        env = os.environ.copy()
+        for key in _PROXY_ENV_KEYS:
+            env.pop(key, None)
+        command = [
+            curl,
+            "--silent", "--show-error", "--location", "--fail",
+            "--connect-timeout", "15", "--max-time", str(timeout),
+            *self._proxy_curl_args(proxy_url),
+        ]
+        if extra:
+            command.extend(extra)
+        command.extend(["--write-out", write_out, url])
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=timeout + 10, env=env)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"Proxy test timed out: {proxy_url}")
+        if result.returncode != 0 and not (allow_timeout and result.returncode == 28):
+            message = (result.stderr or "proxy connection failed").strip()
+            raise RuntimeError(f"Proxy test failed: {message[:180]}")
+        return result.stdout.strip()
+
+    def _run_proxy_stream_upload(self, proxy_url, url, duration=10):
+        """Stream zeroes for a fixed time through a proxy and return curl metrics."""
+        import subprocess
+        curl = shutil.which("curl") or shutil.which("curl.exe")
+        if not curl:
+            raise RuntimeError("Proxy speedtest unavailable: curl is not installed")
+
+        env = os.environ.copy()
+        for key in _PROXY_ENV_KEYS:
+            env.pop(key, None)
+        command = [
+            curl,
+            "--silent", "--show-error", "--location",
+            "--connect-timeout", "15", "--max-time", str(duration),
+            *self._proxy_curl_args(proxy_url),
+            "--request", "POST",
+            "--header", "Content-Type: application/octet-stream",
+            "--header", "Expect:",
+            "--upload-file", "-",
+            "--output", os.devnull,
+            "--write-out", "%{size_upload}\\t%{speed_upload}\\t%{time_total}",
+            url,
+        ]
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=False,
+            env=env,
+        )
+
+        def feed_stdin():
+            chunk = b"0" * (1024 * 1024)
+            try:
+                while process.poll() is None:
+                    process.stdin.write(chunk)
+                    process.stdin.flush()
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+            finally:
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass
+
+        feeder = threading.Thread(target=feed_stdin, daemon=True)
+        feeder.start()
+        try:
+            stdout, stderr = process.communicate(timeout=duration + 15)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate()
+            raise RuntimeError(f"Proxy upload test timed out: {proxy_url}")
+        feeder.join(timeout=2)
+        if process.returncode not in (0, 28):
+            message = stderr.decode(errors="replace").strip() or "proxy connection failed"
+            raise RuntimeError(f"Proxy upload test failed: {message[:180]}")
+        return stdout.decode(errors="replace").strip()
+
+    def _run_proxy_speedtest(self, proxy_url):
+        for attempt in range(2):
+            try:
+                return self._measure_proxy_speedtest(proxy_url)
+            except RuntimeError as exc:
+                # A stalled circuit (common on Tor) can drop one leg of the test.
+                if "no payload" not in str(exc) or attempt:
+                    raise
+
+    def _measure_proxy_speedtest(self, proxy_url):
+        """Measure real proxied TCP throughput; Ookla's static binary ignores proxies."""
+        devnull = os.devnull
+        ip = self._run_proxy_curl(
+            proxy_url,
+            "https://api.ipify.org",
+            "",
+            extra=["--output", "-"],
+        )
+        ping_ms = float(self._run_proxy_curl(
+            proxy_url,
+            "https://api.ipify.org",
+            "%{time_total}",
+            extra=["--output", devnull],
+        )) * 1000
+        # A Tor exit can refuse specific hosts (proof.ovh.net is a common one),
+        # so fall back across mirrors until one leg returns real bytes.
+        download, last_error = None, None
+        for endpoint in (
+            "https://proof.ovh.net/files/10Gb.dat",
+            "https://speed.cloudflare.com/__down?bytes=100000000",
+            "https://ash-speed.hetzner.com/100MB.bin",
+        ):
+            try:
+                metrics = self._run_proxy_curl(
+                    proxy_url,
+                    endpoint,
+                    "%{size_download}\\t%{speed_download}\\t%{time_total}",
+                    extra=["--output", devnull],
+                    timeout=20,
+                    allow_timeout=True,
+                )
+            except RuntimeError as exc:
+                last_error = exc
+                continue
+            download_bytes, download_speed, download_time = metrics.split("\t")
+            if float(download_bytes) > 0:
+                download = (download_bytes, download_speed, download_time)
+                break
+        if download is None:
+            raise last_error or RuntimeError(f"Proxy test returned no payload: {proxy_url}")
+        download_bytes, download_speed, download_time = download
+
+        upload, last_error = None, None
+        for endpoint in (
+            "https://speed.cloudflare.com/__up",
+            "https://librespeed.org/backend/empty.php",
+        ):
+            try:
+                metrics = self._run_proxy_stream_upload(proxy_url, endpoint, duration=10)
+            except RuntimeError as exc:
+                last_error = exc
+                continue
+            upload_bytes, upload_speed, upload_time = metrics.split("\t")
+            if float(upload_bytes) > 0:
+                upload = (upload_bytes, upload_speed, upload_time)
+                break
+        if upload is None:
+            raise last_error or RuntimeError(f"Proxy test returned no payload: {proxy_url}")
+        upload_bytes, upload_speed, upload_time = upload
+
+        return {
+            "server": {
+                "sponsor": "Proxy throughput",
+                "name": "proof.ovh.net + speed.cloudflare.com",
+                "location": "via proxy",
+            },
+            "proxy_used": proxy_url,
+            "external_ip": ip,
+            "download_mbps": round(float(download_speed) * 8 / 1_000_000, 1),
+            "upload_mbps": round(float(upload_speed) * 8 / 1_000_000, 1),
+            "ping_ms": round(ping_ms, 1),
+        }

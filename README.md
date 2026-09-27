@@ -61,6 +61,11 @@ Android users can also install the APK build if they prefer a simpler app-style 
 
 For Termux, full functionality requires a 64-bit Android device. On 32-bit devices, some components and solvers may not work.
 
+The setup also installs `wireproxy` (arm64/armv7) and the pinned WARP registration
+script inside the Ubuntu guest, so Cloudflare WARP and the NordVPN/custom WireGuard
+SOCKS5 tunnels work on Termux too. The first start registers WARP once and saves the
+profile in `/data/warp.conf`; `enable_warp` in the Admin Panel only controls routing.
+
 1.  **Install Termux** from [F-Droid](https://f-droid.org/en/packages/com.termux/) (do NOT use Play Store version).
 2.  **Run the One-Shot Setup**:
     ```bash
@@ -113,9 +118,54 @@ Only basic environment variables need to be set in your `.env` file or container
 | `API_PASSWORD` | Password to protect the proxy API and admin panel | `ep` |
 
 ### 🛡️ Cloudflare WARP Integration
-The Docker image includes an integrated Cloudflare WARP client to bypass IP-based blocks.
+The Docker image includes a pinned WARP registration script and `wireproxy`, providing a
+userspace WireGuard SOCKS5 relay. The generated profile is saved in `/data/warp.conf`
+and reused on subsequent starts.
+It requires no `NET_ADMIN`, privileged mode, `/dev/net/tun`, kernel module, or
+sysctl.
 
 You can enable and configure WARP, customize the excluded domains list, and enter your license key directly from the **Admin Panel**.
+
+### 🧭 NordVPN, custom WireGuard & TorProxy
+Besides WARP, EasyProxy can run extra local SOCKS5 proxies:
+
+| Panel | Profile source | Default SOCKS5 endpoint |
+| :--- | :--- | :--- |
+| `/admin/nordvpn` | NordLynx profile generated from your NordVPN access token and the server you pick | `socks5h://127.0.0.1:1081` |
+| `/admin/wireguard` | Any WireGuard profile pasted into the panel | `socks5h://127.0.0.1:1082` |
+| `/admin/torproxy` | Tor client managed by EasyProxy | `socks5h://127.0.0.1:9050` |
+
+WARP keeps `127.0.0.1:1080`; each tunnel has its own process, port and log,
+so they can run in parallel. Bind addresses are editable in their panels.
+
+Tor is installed in the Docker image and starts only after enabling it from
+`/admin/torproxy`. Automatic circuit rotation is disabled as far as Tor allows
+(30-day maximum circuit lifetime); use **Request new IP** for manual `NEWNYM`.
+An exit can still change after a failure or process restart. The panel includes
+start/stop, manual identity change, Tor egress check and logs. **Exit country**
+is a list loaded live from Tor (onionoo) with only the countries currently
+running exit relays; picking one pins the relay Tor selects in that country, so
+the egress IP stays fixed until **Request new IP**, which picks another relay
+in the same country. Tor is TCP-only and should normally be used on selected
+routes rather than as the default for all streaming traffic.
+
+In the Admin Panel speed test, **Direct** uses Ookla. Every proxy route uses a
+real SOCKS5/HTTP proxied TCP throughput test, shows the egress IP, and does not
+fall back to the direct connection. Proxy routes run one 10-second download and
+one 10-second upload sample.
+
+Reference the endpoint from **Global Proxies**, a **Transport Route** or an extractor
+proxy to route EasyProxy traffic through it. TCP only: the SOCKS5 endpoint cannot
+carry UDP. A missing `DNS`, `MTU` and `PersistentKeepalive` in a pasted profile is
+filled with `1.1.1.1`, `1420` and `25`; IPv6 entries and wg-quick-only directives
+(`Table`, `PostUp`, ...) are stripped before the tunnel starts.
+
+### 🧩 VixSrc FlareSolverr
+The Docker image also contains FlareSolverr, Chromium, and Xvfb. FlareSolverr is
+not started at EasyProxy startup: VixSrc launches it only after detecting a
+Cloudflare challenge, passes the currently selected proxy/WARP route, imports
+the returned cookies and User-Agent, then terminates the process immediately.
+When WARP is active, a missing solver route fails closed instead of using direct.
 
 ---
 
@@ -132,6 +182,8 @@ http://localhost:7860/proxy/manifest.m3u8?url=<URL>
 **Options:**
 - `&clearkey=KID:KEY`: Provide keys for DASH streams.
 - `&warp=off`: Force the request to bypass the WARP VPN and use the server's real IP (Direct Connection).
+- `&host=<HOST>`: Force a specific extractor instead of auto-detection (e.g., `&host=vavoo`).
+- `&max_res=true`: Serve only the highest video variant.
 - `&h_<Header Name>=<Value>`: Pass custom headers (e.g., `&h_User-Agent=VLC`).
 
 ### 🔍 Stream Extractor
@@ -144,7 +196,8 @@ http://localhost:7860/extractor/video?d=<URL>&redirect_stream=true
 ### 📼 DVR & Recordings
 Manage your recordings via the `/recordings` web UI or API.
 - `/record?url=<URL>&name=<NAME>`: Start recording and watch simultaneously.
-- `/api/recordings/start`: Trigger a background recording.
+- Optional parameters: `extractor=<HOST>` (force a specific extractor instead of auto-detection), `max_res=1` (record only the highest video variant), `duration=<SECONDS>`, `key_id=<KID>&key=<KEY>` (ClearKey DRM).
+- `/api/recordings/start`: Trigger a background recording (JSON body accepts the same options: `extractor`, `max_res`).
 
 ---
 

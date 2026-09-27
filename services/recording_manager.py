@@ -53,6 +53,7 @@ class RecordingManager:
         self.start_times: Dict[str, float] = {}
         self._session: Optional[aiohttp.ClientSession] = None
         self._monitor_tasks: Dict[str, asyncio.Task] = {}
+        self._cleanup_task: Optional[asyncio.Task] = None
 
     @property
     def session(self) -> aiohttp.ClientSession:
@@ -95,7 +96,9 @@ class RecordingManager:
     async def _prepare_stream_config(
         self,
         url: str,
-        clearkey: Optional[str] = None
+        clearkey: Optional[str] = None,
+        extractor: Optional[str] = None,
+        max_res: bool = False
     ) -> StreamConfig:
         """
         Prepare stream configuration based on stream type.
@@ -106,14 +109,16 @@ class RecordingManager:
         stream_type = self._detect_stream_type(url)
 
         if stream_type == StreamType.MPD:
-            return await self._prepare_mpd_config(url, clearkey)
+            return await self._prepare_mpd_config(url, clearkey, extractor, max_res)
         else:
-            return self._prepare_hls_config(url, stream_type)
+            return self._prepare_hls_config(url, stream_type, extractor, max_res)
 
     async def _prepare_mpd_config(
         self,
         url: str,
-        clearkey: Optional[str] = None
+        clearkey: Optional[str] = None,
+        extractor: Optional[str] = None,
+        max_res: bool = False
     ) -> StreamConfig:
         """
         Prepare configuration for MPD/DASH streams.
@@ -122,7 +127,7 @@ class RecordingManager:
         - ClearKey DRM requiring decryption parameters
         - Separate audio tracks requiring dual-input recorder
         """
-        proxy_params = self._build_proxy_params(url)
+        proxy_params = self._build_proxy_params(url, extractor, max_res)
 
         # Add ClearKey parameters for DRM-protected streams
         if clearkey and ':' in clearkey:
@@ -154,14 +159,20 @@ class RecordingManager:
             needs_extended_probe=True
         )
 
-    def _prepare_hls_config(self, url: str, stream_type: StreamType) -> StreamConfig:
+    def _prepare_hls_config(
+        self,
+        url: str,
+        stream_type: StreamType,
+        extractor: Optional[str] = None,
+        max_res: bool = False
+    ) -> StreamConfig:
         """
         Prepare configuration for HLS streams (Vavoo, Freeshot, etc.).
 
         HLS streams typically have audio muxed with video, so no separate
         audio URL is needed.
         """
-        proxy_params = self._build_proxy_params(url)
+        proxy_params = self._build_proxy_params(url, extractor, max_res)
         video_url = f"http://127.0.0.1:{PORT}/proxy/hls/manifest.m3u8?{urlencode(proxy_params)}"
 
         logger.info(f"Recording HLS stream ({stream_type.value}): {url[:80]}...")
@@ -174,9 +185,18 @@ class RecordingManager:
             needs_extended_probe=False
         )
 
-    def _build_proxy_params(self, url: str) -> Dict[str, str]:
+    def _build_proxy_params(
+        self,
+        url: str,
+        extractor: Optional[str] = None,
+        max_res: bool = False
+    ) -> Dict[str, str]:
         """Build common proxy parameters."""
         params = {'d': url, 'no_bypass': '1'}
+        if extractor:
+            params['host'] = extractor
+        if max_res:
+            params['max_res'] = 'true'
         if API_PASSWORD:
             params['api_password'] = API_PASSWORD
         return params
@@ -322,7 +342,9 @@ class RecordingManager:
         url: str,
         name: Optional[str] = None,
         duration: Optional[int] = None,
-        clearkey: Optional[str] = None
+        clearkey: Optional[str] = None,
+        extractor: Optional[str] = None,
+        max_res: bool = False
     ) -> Optional[Dict[str, Any]]:
         """
         Start recording a stream.
@@ -334,6 +356,8 @@ class RecordingManager:
             name: Human-readable name for the recording
             duration: Recording duration in seconds (None = max_duration)
             clearkey: ClearKey in format "key_id:key" for DRM-protected streams
+            extractor: Force a specific extractor (host) instead of auto-detection
+            max_res: Record only the highest video variant
 
         Returns:
             Recording info dict or None if failed
@@ -362,7 +386,7 @@ class RecordingManager:
             duration = max_duration
 
         # Prepare stream-specific configuration
-        config = await self._prepare_stream_config(url, clearkey)
+        config = await self._prepare_stream_config(url, clearkey, extractor, max_res)
 
         # Build FFmpeg command
         cmd = self._build_ffmpeg_command(config, file_path, duration)
@@ -587,9 +611,18 @@ class RecordingManager:
                 logger.error(f"Error in cleanup loop: {e}")
             await asyncio.sleep(3600)
 
+    def start_cleanup_loop(self):
+        """Start the maintenance loop once and retain it for clean shutdown."""
+        if self._cleanup_task is None or self._cleanup_task.done():
+            self._cleanup_task = asyncio.create_task(self.cleanup_loop())
+
     async def shutdown(self):
         """Gracefully stop all recordings on shutdown."""
         logger.info("Shutting down RecordingManager...")
+        if self._cleanup_task and not self._cleanup_task.done():
+            self._cleanup_task.cancel()
+            await asyncio.gather(self._cleanup_task, return_exceptions=True)
+        self._cleanup_task = None
         for recording_id in list(self.processes.keys()):
             await self.stop_recording(recording_id)
         for task in list(self._monitor_tasks.values()):

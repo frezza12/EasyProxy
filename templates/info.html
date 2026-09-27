@@ -884,6 +884,8 @@
                     </p>
                     <ul class="feature-list">
                         <li class="feature-item"><span class="feature-bullet">&bull;</span><span><code>d</code> parameter for target URL</span></li>
+                        <li class="feature-item"><span class="feature-bullet">&bull;</span><span><code>host=&lt;HOST&gt;</code> (optional): force a specific extractor</span></li>
+                        <li class="feature-item"><span class="feature-bullet">&bull;</span><span><code>max_res=true</code> (optional): serve only the highest variant</span></li>
                         <li class="feature-item"><span class="feature-bullet">&bull;</span><span>Drop-in compatibility for external clients</span></li>
                     </ul>
                 </div>
@@ -1000,17 +1002,19 @@
                 <div class="endpoint-card">
                     <div class="endpoint-header">
                         <span class="endpoint-method method-get">GET</span>
-                        <code class="endpoint-path">/record?url=&lt;STREAM_URL&gt;&amp;name=&lt;TITLE&gt;&amp;duration=&lt;SECONDS&gt;</code>
+                        <code class="endpoint-path">/record?url=&lt;STREAM_URL&gt;&amp;name=&lt;TITLE&gt;&amp;duration=&lt;SECONDS&gt;&amp;extractor=&lt;HOST&gt;&amp;max_res=1</code>
                     </div>
                     <p class="endpoint-description">
-                        <strong>DVR Recording</strong> &mdash; Start recording a live stream while watching. Optional title and duration parameters. Full recording management via the web interface.
+                        <strong>DVR Recording</strong> &mdash; Start recording a live stream while watching. Optional title, duration, forced extractor and max-res parameters. Full recording management via the web interface.
                     </p>
                     <ul class="feature-list">
                         <li class="feature-item"><span class="feature-bullet">&bull;</span><span>Record while you watch (Smart Mode)</span></li>
                         <li class="feature-item"><span class="feature-bullet">&bull;</span><span>Optional title and duration support</span></li>
+                        <li class="feature-item"><span class="feature-bullet">&bull;</span><span><code>extractor=&lt;HOST&gt;</code>: force a specific extractor instead of auto-detection</span></li>
+                        <li class="feature-item"><span class="feature-bullet">&bull;</span><span><code>max_res=1</code>: record only the highest video variant</span></li>
                         <li class="feature-item"><span class="feature-bullet">&bull;</span><span>Full management at <code>/recordings</code></span></li>
                     </ul>
-                    <div class="example-block">/record?url=https://stream.m3u8&name=LiveTV&duration=3600</div>
+                    <div class="example-block">/record?url=https://stream.m3u8&name=LiveTV&duration=3600&extractor=vavoo&max_res=1</div>
                 </div>
             </section>
 
@@ -1041,6 +1045,26 @@
                         <tr><td><span class="endpoint-method method-post">POST</span></td><td><code>/generate_urls</code></td><td>Batch generate proxy URLs</td></tr>
                     </tbody>
                 </table>
+
+                <div class="table-section-title">&#x2728; DUAL Video + Audio</div>
+                <p class="endpoint-description">
+                    DUAL creates a single HLS manifest with synchronized video and audio. The service is integrated into EasyProxy and does not use a separate sidecar. The first request may take time for extraction, audio preparation, and synchronization.
+                </p>
+                <table class="api-table">
+                    <thead>
+                        <tr><th width="100">Method</th><th>Endpoint</th><th>Description</th></tr>
+                    </thead>
+                    <tbody>
+                        <tr><td><span class="endpoint-method method-get">GET</span></td><td><code>/dual/manifest.m3u8?d=&lt;BASE64_JSON&gt;</code></td><td>DUAL HLS master with synchronized audio; video always served through EasyProxy</td></tr>
+                        <tr><td><span class="endpoint-method method-post">POST</span></td><td><code>/dual/sync/links</code></td><td>JSON test: resolves video/audio and returns the synchronization result</td></tr>
+                        <tr><td><span class="endpoint-method method-post">POST</span></td><td><code>/dual/cache/status</code></td><td>Checks only the shared DUAL offset cache</td></tr>
+                        <tr><td><span class="endpoint-method method-get">GET</span></td><td><code>/dual/aud/&lt;hid&gt;/audio.m3u8</code></td><td>Audio playlist converted and served by the proxy</td></tr>
+                        <tr><td><span class="endpoint-method method-get">GET</span></td><td><code>/dual/aud/&lt;hid&gt;/init.mp4</code></td><td>Initial DUAL audio fMP4 segment</td></tr>
+                        <tr><td><span class="endpoint-method method-get">GET</span></td><td><code>/dual/aud/&lt;hid&gt;/s&lt;idx&gt;.m4s</code></td><td>DUAL audio fMP4 segment</td></tr>
+                        <tr><td><span class="endpoint-method method-get">GET</span></td><td><code>/api/dual/memory</code></td><td>Active DUAL memory usage and audio tracks</td></tr>
+                    </tbody>
+                </table>
+                <div class="example-block">Payload d (prima di Base64 URL-safe): {"video":{"url":"https://example.com/video.m3u8"},"audio":{"extractor":"vixsrc","d":"https://vixsrc.to/movie/1339713/"},"audio_lang":"ita"}</div>
 
                 <div class="table-section-title">&#x1F4FA; Proxy &amp; Streaming</div>
                 <table class="api-table">
@@ -1392,5 +1416,6 @@
             });
         });
     </script>
+<script src="/static/ep-nav.js"></script>
 </body>
 </html>

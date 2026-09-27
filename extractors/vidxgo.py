@@ -9,12 +9,10 @@ re-fetches the embed page on each extract() call to get fresh tokens.
 import base64
 import logging
 import re
-import time
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
 
-from aiohttp import ClientSession, ClientTimeout, TCPConnector
-
-from config import get_connector_for_proxy, get_ordered_proxies_for_url, should_allow_direct_fallback
+import config as _cfg
+from config import get_ordered_proxies_for_url, should_allow_direct_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -35,8 +33,7 @@ def _parse_e_expiry(url: str) -> float | None:
     except Exception:
         return None
 
-# Default playback domain for headers (Referer/Origin). Can be overridden
-# via the `vd_domain=` query parameter forwarded by the addon.
+# Hardcoded playback domain for CDN Referer/Origin headers.
 DEFAULT_PLAYBACK_DOMAIN = "https://v.vidxgo.co"
 
 # Header used during the embed page fetch. The site is currently strict about
@@ -67,6 +64,8 @@ class VidXgoExtractor:
         self.proxies = proxies or []
         self.selected_proxy = None
         self.session = None
+        self._curl_session = None
+        self._curl_impersonate = None
         self.mediaflow_endpoint = "hls_proxy"
 
         # Headers used for fetching the embed page.
@@ -108,30 +107,100 @@ class VidXgoExtractor:
 
     # ------------------------------------------------------------------ proxies
 
-    def _get_proxies_for_url(self, url: str) -> list[str]:
-        return get_ordered_proxies_for_url(url, self.extractor_name, self.proxies)
+    @staticmethod
+    def _normalize_proxy_url(proxy_value: str) -> str:
+        proxy_value = unquote(proxy_value).strip()
+        # WARP is local-DNS SOCKS5. Do not turn it into socks5h: wireproxy
+        # remote DNS is the source of the observed timeout.
+        if proxy_value.startswith("socks5://"):
+            return proxy_value
+        if proxy_value.startswith("socks4a://"):
+            return proxy_value.replace("socks4a://", "socks4://", 1)
+        return proxy_value
+
+    def _get_proxies_for_url(self, url: str, bypass_warp: bool = False) -> list[str]:
+        return get_ordered_proxies_for_url(
+            url,
+            self.extractor_name,
+            self.proxies,
+            bypass_warp=bypass_warp,
+        )
 
     # ------------------------------------------------------------------ fetch
 
-    async def _fetch(self, url: str, headers: dict) -> str:
-        """GET `url`; ruota i Referer whitelistati se necessario."""
-        paths = self._get_proxies_for_url(url)
-        if should_allow_direct_fallback(paths):
-            paths.append(None)
-        last_error = None
-        for proxy in paths:
-            timeout = ClientTimeout(total=25, connect=10, sock_read=20)
-            connector = get_connector_for_proxy(proxy) if proxy else TCPConnector(ssl=False)
+    async def _get_curl_session(self, proxy_url=None, impersonate="chrome124"):
+        """Reuse the curl_cffi connection pool during one extraction."""
+        curl_options = _cfg.get_curl_ipv4_options(proxy_url).get("curl_options") or {}
+        if self._curl_session is None or self._curl_impersonate != impersonate:
+            if self._curl_session is not None:
+                await self._curl_session.close()
             try:
-                async with ClientSession(timeout=timeout, connector=connector) as session:
-                    async with session.get(url, headers=headers, ssl=False) as resp:
-                        resp.raise_for_status()
-                        text = await resp.text()
-                        self.selected_proxy = proxy
-                        return text
-            except Exception as e:
-                last_error = e
-                logger.debug(f"vidxgo fetch failed via {proxy or 'direct'}: {e}")
+                from curl_cffi.requests import AsyncSession as CurlAsyncSession
+            except ImportError as exc:
+                raise ExtractorError("VidXgo: curl_cffi is required") from exc
+            self._curl_session = CurlAsyncSession(
+                impersonate=impersonate,
+                curl_options=curl_options,
+            )
+            self._curl_impersonate = impersonate
+        else:
+            self._curl_session.curl_options = curl_options
+        return self._curl_session
+
+    async def _fetch(self, url: str, headers: dict, bypass_warp: bool = False) -> str:
+        """GET `url` through the configured network routes."""
+        paths = self._get_proxies_for_url(url, bypass_warp=bypass_warp)
+        if should_allow_direct_fallback(paths, bypass_warp=bypass_warp):
+            paths.append(None)
+        logger.info(
+            "vidxgo fetch routes for %s: %s",
+            url,
+            ", ".join(proxy or "direct" for proxy in paths) or "none",
+        )
+        curl_headers = {
+            key: value for key, value in headers.items()
+            if key.lower() != "user-agent"
+        }
+        last_error = None
+        for impersonate in ("chrome131", "chrome124", "chrome120"):
+            for proxy in paths:
+                proxy_url = self._normalize_proxy_url(proxy) if proxy else None
+                request_kwargs = {
+                    "proxies": {"http": proxy_url, "https": proxy_url}
+                } if proxy_url else {}
+                try:
+                    logger.info(
+                        "vidxgo curl fetch via %s for %s (imp=%s)",
+                        proxy_url or "direct",
+                        url,
+                        impersonate,
+                    )
+                    session = await self._get_curl_session(proxy_url, impersonate)
+                    resp = await session.get(
+                        url,
+                        headers=curl_headers,
+                        timeout=25,
+                        verify=False,
+                        allow_redirects=True,
+                        **request_kwargs,
+                    )
+                    if 200 <= resp.status_code < 300:
+                        self.selected_proxy = proxy_url
+                        return resp.text
+                    last_error = ExtractorError(
+                        f"curl_cffi HTTP {resp.status_code} via {proxy_url or 'direct'}"
+                    )
+                except Exception as e:
+                    last_error = e
+                    logger.debug(
+                        "vidxgo curl fetch failed via %s (imp=%s): %s",
+                        proxy_url or "direct",
+                        impersonate,
+                        e,
+                    )
+
+        if last_error:
+            raise ExtractorError(f"VidXgo: fetch failed for {url}: {last_error}")
         raise ExtractorError(f"VidXgo: fetch failed for {url}: {last_error}")
 
     # ------------------------------------------------------------------ decode
@@ -188,14 +257,7 @@ class VidXgoExtractor:
         background_refresh = bool(kwargs.get("background_refresh"))
         request_headers = kwargs.get("request_headers") or {}
 
-        vd_domain = (
-            kwargs.get("vd_domain")
-            or kwargs.get("h_referer")
-            or DEFAULT_PLAYBACK_DOMAIN
-        )
-        vd_domain = vd_domain.rstrip("/")
-        if not vd_domain.startswith("http"):
-            vd_domain = f"https://{vd_domain}"
+        vd_domain = DEFAULT_PLAYBACK_DOMAIN
         playback_headers = {
             **self.playback_headers,
             "referer": f"{vd_domain}/",
@@ -205,7 +267,7 @@ class VidXgoExtractor:
         bypass_warp = bool(kwargs.get("bypass_warp"))
         # 1. Fetch embed page.
         embed_headers = {**self.embed_headers, **{k.lower(): v for k, v in request_headers.items() if k.lower() == "cookie"}}
-        html = await self._fetch(url, embed_headers)
+        html = await self._fetch(url, embed_headers, bypass_warp=bypass_warp)
         if not html:
             raise ExtractorError(f"VidXgo: empty embed page for {url}")
 
@@ -213,38 +275,49 @@ class VidXgoExtractor:
         m3u8_url = self._decode_embed(html)
         logger.info(f"vidxgo: extracted m3u8 for {url} -> {m3u8_url[:80]}...")
 
-        # 3. Fetch master + each referenced variant playlist.
-        master_text = await self._fetch(m3u8_url, playback_headers)
+        # 3. Fetch the master. Variant selection (all variants or only the
+        # highest one) is decided by the proxy rewriter via max_res.
+        master_text = await self._fetch(m3u8_url, playback_headers, bypass_warp=bypass_warp)
         if "#EXTM3U" not in master_text:
             raise ExtractorError("VidXgo: extracted URL did not return a valid HLS manifest")
 
-        from urllib.parse import urljoin
-        captured_map: dict[str, str] = {}
-        master_lines = master_text.splitlines()
-        variant_urls: list[str] = []
-        for i, line in enumerate(master_lines):
-            if line.startswith("#EXT-X-STREAM-INF:") and i + 1 < len(master_lines):
-                raw = master_lines[i + 1].strip()
-                if raw and not raw.startswith("#"):
-                    variant_urls.append(urljoin(m3u8_url, raw))
+        captured_map: dict[str, str] = {m3u8_url: master_text}
+        if force_refresh:
+            # Segment recovery needs media playlists, not just the master.
+            from urllib.parse import urljoin
 
-        for line in master_lines:
-            if line.startswith("#EXT-X-MEDIA:") and 'URI="' in line:
-                uri_start = line.find('URI="') + 5
-                uri_end = line.find('"', uri_start)
-                if uri_start > 4 and uri_end > uri_start:
-                    media_url = urljoin(m3u8_url, line[uri_start:uri_end])
-                    if media_url not in variant_urls:
-                        variant_urls.append(media_url)
-
-        for v_url in variant_urls:
-            try:
-                v_text = await self._fetch(v_url, playback_headers)
-                captured_map[v_url] = v_text
-            except Exception as e:
-                logger.warning(f"vidxgo: variant fetch failed {v_url[:80]}...: {e}")
-
-        captured_map[m3u8_url] = master_text
+            pending = [(m3u8_url, master_text)]
+            seen = {m3u8_url}
+            while pending and len(seen) < 16:
+                parent_url, manifest = pending.pop(0)
+                variant_next = False
+                for line in manifest.splitlines():
+                    line = line.strip()
+                    child = None
+                    if line.startswith("#EXT-X-STREAM-INF:"):
+                        variant_next = True
+                        continue
+                    if line.startswith("#EXT-X-MEDIA:"):
+                        match = re.search(r'URI="([^"]+)"', line)
+                        child = match.group(1) if match else None
+                    elif line and not line.startswith("#"):
+                        if variant_next:
+                            child = line
+                        variant_next = False
+                    if not child:
+                        continue
+                    child_url = urljoin(parent_url, child)
+                    if child_url in seen or len(seen) >= 16:
+                        continue
+                    seen.add(child_url)
+                    try:
+                        child_text = await self._fetch(child_url, playback_headers, bypass_warp=bypass_warp)
+                    except Exception as exc:
+                        logger.debug("VidXgo recovery playlist fetch failed: %s", exc)
+                        continue
+                    if "#EXTM3U" in child_text:
+                        captured_map[child_url] = child_text
+                        pending.append((child_url, child_text))
 
         result = {
             "destination_url": m3u8_url,
@@ -258,5 +331,12 @@ class VidXgoExtractor:
         return result
 
     async def close(self):
+        if self._curl_session is not None:
+            try:
+                await self._curl_session.close()
+            except Exception:
+                pass
+            self._curl_session = None
+            self._curl_impersonate = None
         if self.session and not self.session.closed:
             await self.session.close()
